@@ -5,6 +5,8 @@ use std::process::ExitCode;
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use fiio_core::config::{Config, PathStyle, Paths};
+use fiio_core::import::{self, OnConflict};
+use fiio_core::iprune::{IpruneConfig, IprunePaths};
 use fiio_core::store::Store;
 use fiio_core::{playlists, scan};
 
@@ -45,6 +47,66 @@ enum Command {
     /// List and edit playlists.
     #[command(subcommand)]
     Playlist(PlaylistCommand),
+    /// Copy playlists in from iprune's folder, an iPod or an iTunesDB file.
+    #[command(subcommand)]
+    Import(ImportCommand),
+}
+
+#[derive(Subcommand)]
+enum ImportCommand {
+    /// From iprune's playlists folder.
+    Iprune {
+        /// Playlists to import; all when none is given.
+        names: Vec<String>,
+        /// When fiio-tunes already has a playlist of the name.
+        #[arg(long, value_enum, default_value = "skip")]
+        on_conflict: Conflict,
+        /// List the playlists that can be imported; write nothing.
+        #[arg(long)]
+        list: bool,
+    },
+    /// From a mounted iPod, or a copy of its database.
+    Ipod {
+        /// Playlists to import; all when none is given.
+        names: Vec<String>,
+        /// Read this iTunesDB file instead of a mounted iPod.
+        #[arg(long, value_name = "ITUNESDB", conflicts_with = "mountpoint")]
+        file: Option<PathBuf>,
+        /// The iPod mounted here, instead of finding it.
+        #[arg(long, value_name = "DIR")]
+        mountpoint: Option<PathBuf>,
+        /// When fiio-tunes already has a playlist of the name.
+        #[arg(long, value_enum, default_value = "skip")]
+        on_conflict: Conflict,
+        /// Make the iPod's iprune sync scope the default one ([sync] in the
+        /// config), when every playlist it names was imported.
+        #[arg(long, conflicts_with = "list")]
+        scope: bool,
+        /// List the iPod's playlists and how many of their tracks have a
+        /// library file; write nothing.
+        #[arg(long)]
+        list: bool,
+    },
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum Conflict {
+    /// Keep the existing playlist, import nothing.
+    Skip,
+    /// Write the imported playlist over the existing one.
+    Replace,
+    /// Import as "<name> (iPod)".
+    Rename,
+}
+
+impl From<Conflict> for OnConflict {
+    fn from(c: Conflict) -> Self {
+        match c {
+            Conflict::Skip => OnConflict::Skip,
+            Conflict::Replace => OnConflict::Replace,
+            Conflict::Rename => OnConflict::Rename,
+        }
+    }
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -364,6 +426,269 @@ fn playlist(cmd: &PlaylistCommand) -> Result<Outcome> {
     Ok(Outcome::Done)
 }
 
+fn iprune_paths() -> Result<IprunePaths> {
+    IprunePaths::from_env().ok_or_else(|| anyhow!("cannot determine the home directory"))
+}
+
+/// Whether fiio-tunes already has a playlist of this name.
+fn taken(config: &Config, name: &str) -> bool {
+    playlists::file_for(config, name).is_ok_and(|f| f.exists())
+}
+
+/// Exits 1, after the report, when a playlist could not be written.
+fn check_failed(failed: &[(String, String)]) -> Result<()> {
+    if !failed.is_empty() {
+        let names: Vec<&str> = failed.iter().map(|(n, _)| n.as_str()).collect();
+        bail!(
+            "{} playlists not imported: {}",
+            failed.len(),
+            names.join(", ")
+        );
+    }
+    Ok(())
+}
+
+fn print_imported(out: &mut impl Write, done: &[import::Imported]) -> io::Result<()> {
+    let count = |o: import::Outcome| done.iter().filter(|i| i.outcome == o).count();
+    writeln!(
+        out,
+        "imported: {} new, {} replaced, {} renamed, {} skipped",
+        count(import::Outcome::Created),
+        count(import::Outcome::Replaced),
+        count(import::Outcome::Renamed),
+        count(import::Outcome::Skipped)
+    )?;
+    for i in done {
+        let n = i.entries;
+        match i.outcome {
+            import::Outcome::Created => writeln!(out, "  + {} ({n} entries)", i.name)?,
+            import::Outcome::Replaced => writeln!(out, "  ~ {} ({n} entries, replaced)", i.name)?,
+            import::Outcome::Renamed => {
+                writeln!(out, "  + {} ({n} entries, from {:?})", i.name, i.source)?
+            }
+            import::Outcome::Skipped => writeln!(
+                out,
+                "  = {:?} skipped: {:?} exists (--on-conflict replace or rename)",
+                i.source, i.name
+            )?,
+        }
+    }
+    Ok(())
+}
+
+fn import_iprune(names: &[String], on_conflict: Conflict, list: bool) -> Result<()> {
+    let (config, store) = load()?;
+    let conn = store.conn();
+    let ip = iprune_paths()?;
+    let src = import::iprune_folder(&config, &ip.config_file)?;
+    let mut out = io::stdout().lock();
+    print_list(
+        &mut out,
+        "unreadable in iprune's folder",
+        &src.problems,
+        |(p, why)| format!("{}: {why}", p.display()),
+    )?;
+    if list {
+        writeln!(out, "iprune's playlists in {}:", src.dir.display())?;
+        for (name, file) in &src.playlists {
+            let entries = fiio_core::playlist::read(file)
+                .map_or_else(|e| format!("({e})"), |e| e.len().to_string());
+            let mark = if taken(&config, name) {
+                "  (name taken)"
+            } else {
+                ""
+            };
+            writeln!(out, "{entries:>5}  {name}{mark}")?;
+        }
+        return Ok(());
+    }
+    let r = import::import_iprune(conn, &config, &src, names, on_conflict.into())?;
+    print_imported(&mut out, &r.playlists)?;
+    print_list(
+        &mut out,
+        "entries with no library file, kept as they were",
+        &r.unresolved,
+        |(n, e)| format!("{n}: {e}"),
+    )?;
+    print_list(&mut out, "playlists not read", &r.unreadable, |(p, why)| {
+        format!("{}: {why}", p.display())
+    })?;
+    print_list(&mut out, "playlists not written", &r.failed, |(n, why)| {
+        format!("{n}: {why}")
+    })?;
+    check_failed(&r.failed)
+}
+
+fn how(h: Option<import::How>) -> String {
+    use fiio_core::adopt::Reason;
+    use import::How;
+    match h {
+        None => "no library file".into(),
+        Some(How::Iprune) => "through iprune's index".into(),
+        Some(How::Identical) => "identical file".into(),
+        Some(How::Tags) => "same size, duration, title and artist".into(),
+        Some(How::Proposal(r)) => match r {
+            Reason::WeakTags => "same size and duration, title or artist differ",
+            Reason::SeveralCandidates => "one of several identical library files",
+            Reason::SharedWithAnotherDeviceTrack => "duplicate on the iPod",
+            Reason::TagsOnly => "same artist, title and album, another size",
+        }
+        .into(),
+    }
+}
+
+struct IpodArgs<'a> {
+    names: &'a [String],
+    file: Option<&'a Path>,
+    mountpoint: Option<&'a Path>,
+    on_conflict: Conflict,
+    scope: bool,
+    list: bool,
+}
+
+fn import_ipod(a: IpodArgs) -> Result<()> {
+    let (mut config, store) = load()?;
+    let conn = store.conn();
+    let ip = iprune_paths()?;
+    let source = match (a.file, a.mountpoint) {
+        (Some(f), _) => import::IpodSource::File(f.to_owned()),
+        (None, Some(m)) => import::IpodSource::Mounted(m.to_owned()),
+        (None, None) => import::IpodSource::Mounted(fiio_core::ipod::find_ipod()?),
+    };
+    let db = import::open(&source)?;
+    let tty = io::stderr().is_terminal();
+    let progress = |done: usize, total: usize| {
+        if tty {
+            eprint!("\rcomparing iPod files with the library {done}/{total}  ");
+        }
+    };
+    let ipod = import::read_ipod(conn, &db, Some(&ip.database), &progress)?;
+    if tty && ipod.compared + ipod.unreadable.len() > 0 {
+        eprintln!();
+    }
+    let mut out = io::stdout().lock();
+    let c = &ipod.contents;
+    writeln!(
+        out,
+        "iPod: {} (GUID {}), {} tracks, {} playlists",
+        c.name.as_deref().unwrap_or("?"),
+        c.firewire_guid.as_deref().unwrap_or("unknown"),
+        c.tracks.len(),
+        c.playlists.len()
+    )?;
+    match (&ipod.iprune_device, &ipod.iprune_error) {
+        (_, Some(e)) => writeln!(
+            out,
+            "iprune's index could not be read ({e}); traced by tags only"
+        )?,
+        (Some(d), None) => writeln!(
+            out,
+            "iprune knows this iPod as {} ({})",
+            d.name.as_deref().unwrap_or("?"),
+            d.firewire_guid
+        )?,
+        (None, None) => writeln!(
+            out,
+            "iprune has no record of this iPod; traced by tags only"
+        )?,
+    }
+    writeln!(out, "tracks in playlists:")?;
+    for (h, n) in ipod.counts() {
+        writeln!(out, "  {n}: {}", how(h))?;
+    }
+    if ipod.compared + ipod.unreadable.len() > 0 {
+        writeln!(
+            out,
+            "iPod files compared with the library: {} ({} unreadable)",
+            ipod.compared,
+            ipod.unreadable.len()
+        )?;
+    }
+    let describe = |dbid: u64| match ipod.track(dbid) {
+        Some(t) => format!(
+            "{} - {} [{}] {}",
+            t.adopt.artist.as_deref().unwrap_or("?"),
+            t.adopt.title.as_deref().unwrap_or("?"),
+            t.adopt.album.as_deref().unwrap_or("?"),
+            t.ipod_path.as_deref().unwrap_or("?")
+        ),
+        None => format!("{dbid:016x}"),
+    };
+    print_list(
+        &mut out,
+        "iPod files not read",
+        &ipod.unreadable,
+        |(d, why)| format!("{}: {why}", describe(*d)),
+    )?;
+    if a.list {
+        writeln!(out, "playlists (tracks with a library file / entries):")?;
+        for pl in &c.playlists {
+            let t = ipod.traced_playlist(pl);
+            let name = import::playlist_name(&pl.name);
+            let smart = if pl.smart { "  (smart)" } else { "" };
+            let mark = if taken(&config, &name) {
+                "  (name taken)"
+            } else {
+                ""
+            };
+            writeln!(
+                out,
+                "{:>5}/{:<5}  {}{smart}{mark}",
+                t.tracks.len(),
+                pl.members.len(),
+                pl.name
+            )?;
+        }
+        return Ok(());
+    }
+    let r = import::import_ipod(conn, &config, &ipod, a.names, a.on_conflict.into())?;
+    print_imported(&mut out, &r.playlists)?;
+    for (name, left) in &r.left_out {
+        print_list(
+            &mut out,
+            &format!("{name}: left out, no library file"),
+            left,
+            |d| describe(*d),
+        )?;
+    }
+    print_list(&mut out, "playlists not written", &r.failed, |(n, why)| {
+        format!("{n}: {why}")
+    })?;
+    if a.scope {
+        let ic = match ip.config_file.exists() {
+            true => IpruneConfig::load(&ip.config_file)?,
+            false => IpruneConfig::default(),
+        };
+        match import::iprune_scope(&ic, &ipod, &r)? {
+            import::ScopeCopy::Ready { scope, playlists } => {
+                let paths = paths()?;
+                config.sync.scope = scope;
+                config.sync.playlists = playlists;
+                config.save(&paths.config_file)?;
+                let what = match scope {
+                    fiio_core::config::Scope::All => "the whole library".to_owned(),
+                    fiio_core::config::Scope::Playlists => {
+                        format!("only {}", config.sync.playlists.join(", "))
+                    }
+                    fiio_core::config::Scope::Except => {
+                        format!("all except {}", config.sync.playlists.join(", "))
+                    }
+                };
+                writeln!(out, "default sync scope set to iprune's: {what}")?;
+            }
+            import::ScopeCopy::Missing(missing) => {
+                // A playlist that failed to write is the first thing to fix.
+                check_failed(&r.failed)?;
+                bail!(
+                    "scope not copied: iprune's scope names playlists that were not imported: {}",
+                    missing.join(", ")
+                )
+            }
+        }
+    }
+    check_failed(&r.failed)
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let result = match &cli.command {
@@ -375,6 +700,27 @@ fn main() -> ExitCode {
         } => init(library, playlists, *path_style, *force).map(|()| Outcome::Done),
         Command::Scan => run_scan().map(|()| Outcome::Done),
         Command::Playlist(cmd) => playlist(cmd),
+        Command::Import(ImportCommand::Iprune {
+            names,
+            on_conflict,
+            list,
+        }) => import_iprune(names, *on_conflict, *list).map(|()| Outcome::Done),
+        Command::Import(ImportCommand::Ipod {
+            names,
+            file,
+            mountpoint,
+            on_conflict,
+            scope,
+            list,
+        }) => import_ipod(IpodArgs {
+            names,
+            file: file.as_deref(),
+            mountpoint: mountpoint.as_deref(),
+            on_conflict: *on_conflict,
+            scope: *scope,
+            list: *list,
+        })
+        .map(|()| Outcome::Done),
     };
     match result {
         Ok(Outcome::Done) => ExitCode::SUCCESS,

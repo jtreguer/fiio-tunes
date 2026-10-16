@@ -37,6 +37,22 @@ pub enum Error {
         "another fiio-tunes is syncing, repairing, restoring or ejecting the card; try again once it is done"
     )]
     CardBusy,
+    #[error(
+        "{0:?} names several playlists; give the exact name, or import without names to take them all"
+    )]
+    AmbiguousName(String),
+    #[error("{0}")]
+    Iprune(String),
+    #[error(transparent)]
+    Gpod(#[from] gpod::Error),
+    #[error("no iPod found among the mounted filesystems")]
+    NoIpod,
+    #[error("several iPods are mounted ({0}); name one with --mountpoint")]
+    SeveralIpods(String),
+    #[error(
+        "device detection is off (FIIO_TUNES_NO_DETECT is set); name the iPod with --mountpoint"
+    )]
+    DetectionOff,
     #[error("position {position} is out of range (playlist has {len} entries)")]
     BadPosition { position: usize, len: usize },
 }

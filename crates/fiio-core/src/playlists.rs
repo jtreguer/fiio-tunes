@@ -62,17 +62,17 @@ fn existing_file(cfg: &Config, name: &str) -> Result<PathBuf> {
 }
 
 /// The playlist files of a folder, and what could not be read in it.
-struct Listing {
+pub(crate) struct Listing {
     /// `(name, path)` of every playlist file, sorted by name.
-    files: Vec<(String, PathBuf)>,
+    pub(crate) files: Vec<(String, PathBuf)>,
     /// Entries that could not be read or named: a playlist may be among
     /// them, so none is taken as deleted while there are any.
-    problems: Vec<(PathBuf, String)>,
+    pub(crate) problems: Vec<(PathBuf, String)>,
 }
 
 /// The playlist files in `dir`. Hidden files (including fiio-tunes' own
 /// temporary files) are ignored, as is a link to nothing.
-fn playlist_files(dir: &Path) -> Result<Listing> {
+pub(crate) fn playlist_files(dir: &Path) -> Result<Listing> {
     let mut files = Vec::new();
     let mut problems = Vec::new();
     for e in std::fs::read_dir(dir).at(dir)? {
@@ -108,10 +108,15 @@ fn playlist_files(dir: &Path) -> Result<Listing> {
 }
 
 fn resolve(conn: &Connection, cfg: &Config, entries: Vec<Entry>) -> Result<Vec<Item>> {
+    resolve_in(conn, &cfg.playlists.dir, entries)
+}
+
+/// Resolves the entries of a playlist file in `dir`.
+pub(crate) fn resolve_in(conn: &Connection, dir: &Path, entries: Vec<Entry>) -> Result<Vec<Item>> {
     entries
         .into_iter()
         .map(|entry| {
-            let abs = paths::absolute(Path::new(&entry.location), &cfg.playlists.dir);
+            let abs = paths::absolute(Path::new(&entry.location), dir);
             let track = match paths::key(&abs) {
                 Some(k) => store::present_track_by_key(conn, &k)?,
                 None => None,
@@ -335,6 +340,26 @@ pub fn show(conn: &Connection, cfg: &Config, name: &str) -> Result<Vec<Item>> {
 pub fn create(conn: &Connection, cfg: &Config, name: &str) -> Result<()> {
     let file = file_for(cfg, name)?;
     match write(conn, cfg, name, &file, &mut [], WriteMode::CreateNew) {
+        Err(Error::Io { source, .. }) if source.kind() == std::io::ErrorKind::AlreadyExists => {
+            Err(Error::PlaylistExists(name.to_owned()))
+        }
+        r => r,
+    }
+}
+
+/// Writes a playlist brought in from elsewhere, whole: resolved entries in
+/// the configured style, the others as they are. `mode` says whether it is
+/// a new file or replaces the one read at a given mtime.
+pub fn write_imported(
+    conn: &Connection,
+    cfg: &Config,
+    name: &str,
+    mut items: Vec<Item>,
+    loose: &[String],
+    mode: WriteMode,
+) -> Result<()> {
+    let file = file_for(cfg, name)?;
+    match write_with(conn, cfg, name, &file, &mut items, loose, mode) {
         Err(Error::Io { source, .. }) if source.kind() == std::io::ErrorKind::AlreadyExists => {
             Err(Error::PlaylistExists(name.to_owned()))
         }

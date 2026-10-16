@@ -14,7 +14,7 @@ its behaviour must stay identical to iprune's.
 
 ## Status
 
-F0 done (workspace, forked crates, `init`, `scan`, `playlist`). Milestones in
+F0 and F1 done (workspace, forked crates, `init`, `scan`, `playlist`, `import`). Milestones in
 `docs/technical.md` section 16:
 
 | # | Deliverable | Writes to the card |

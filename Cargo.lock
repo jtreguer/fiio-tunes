@@ -421,6 +421,7 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "directories",
+ "gpod",
  "lofty",
  "proptest",
  "rayon",
@@ -441,6 +442,7 @@ dependencies = [
  "anyhow",
  "clap",
  "fiio-core",
+ "rusqlite",
  "tempfile",
 ]
 

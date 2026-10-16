@@ -307,11 +307,34 @@ rows missing for 30 days and on no device (dropped).
   `tracks.path`, looked up in fiio-tunes' index by `path_key`; then by the
   adoption matcher on size, duration and tags, with the content check when
   the iPod is mounted. Members with no library file are left out and listed.
-- **Names.** A name already in fiio-tunes' folder is skipped, replaced (an
-  ordinary write, with the mtime check) or imported as `<name> (iPod)`.
+- **Names.** A name already in fiio-tunes' folder is skipped (the default),
+  replaced (an ordinary write, with the mtime check) or imported as
+  `<name> (iPod)`, then `<name> (iPod 2)` and so on. A name the same import
+  already wrote (two iPod playlists of one name, or "A/B" and "A_B") is
+  always renamed, so an import never replaces a playlist it wrote. A
+  playlist that cannot be written is reported and the others are still
+  imported; the command then exits 1. An iPod playlist's name
+  has the characters iprune's file names cannot hold (`/ \ : * ? " < > |`)
+  and line breaks replaced by `_`, as iprune's own files have them, and a
+  leading `.` made `_`. Names given on the command line are found by
+  iprune's three name passes; two playlists equal under the pass that finds
+  them are refused as ambiguous.
 - **Scope.** Optionally, the iPod's iprune scope (`devices.scope` and
-  `device_scope_playlists`) becomes the X3's when every playlist it names was
-  imported.
+  `device_scope_playlists`, or iprune's `[sync]` when the scope is NULL)
+  becomes the X3's when every playlist it names was imported. Until F3 there
+  is no X3 row in `devices`, so it is written to `[sync]` in the config, the
+  scope of a device with no selection of its own. iprune's names are traced
+  to the iPod's playlists through `device_playlists.ipod_id`, then by the
+  name passes.
+
+The `adopt.rs` matcher is iprune's, with the device track named by a `u64`
+key. For an import it is used without the one-to-one rule of an adoption:
+a playlist needs the song, so every accepted match and every proposal's
+default is taken, and duplicates on the iPod (two iPod tracks claiming one
+library file) all go to that file. The iPod's record in iprune's index is
+found by its FireWire GUID; for an `iTunesDB` file, whose GUID is usually
+unknown, it is the iPod whose mappings name the most of the file's dbids.
+An index that cannot be read leaves the tracing to the matcher, and says so.
 
 Import never writes to the iPod, the backup, iprune's index or iprune's
 playlists folder.
@@ -322,7 +345,8 @@ playlists folder.
 fiio-tunes init --library DIR... --playlists DIR [--path-style S] [--force]
 fiio-tunes scan
 fiio-tunes playlist list|show|new|rm|rename|add|remove|move ...
-fiio-tunes import iprune [NAME...] | ipod [--file ITUNESDB] [NAME...] [--on-conflict skip|replace|rename] [--scope]
+fiio-tunes import iprune [NAME...] [--on-conflict skip|replace|rename] [--list]
+fiio-tunes import ipod [--file ITUNESDB | --mountpoint DIR] [NAME...] [--on-conflict ...] [--scope | --list]
 fiio-tunes device info
 fiio-tunes probe [--clean]
 fiio-tunes adopt [--accept-proposals] [--force]
@@ -333,6 +357,13 @@ fiio-tunes restore <stamp> [--yes]
 fiio-tunes doctor [--fix] [--yes]
 fiio-tunes eject
 ```
+
+`import` with no NAME takes every playlist; `--list` shows them, with the
+names already taken and, for an iPod, how many members have a library file,
+and writes nothing. Without `--file` or `--mountpoint`, `import ipod` uses
+the one mounted filesystem holding `iPod_Control/iTunes/iTunesDB`;
+`FIIO_TUNES_NO_DETECT` turns that off. A scope that cannot be copied is an
+error (exit 1) after the playlists are imported.
 
 ## 14. Desktop UI
 
