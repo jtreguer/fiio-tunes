@@ -177,9 +177,12 @@ fn tags_from(tag: &Tag) -> Tags {
     }
 }
 
+/// Opens a file for [`read_with`].
+pub type Opener = dyn Fn(&Path) -> std::io::Result<File>;
+
 /// The codec of an MP4 file, and whether it is FairPlay protected.
-fn mp4_kind(path: &Path) -> Result<(FileKind, bool), ReadError> {
-    let mut f = File::open(path).map_err(|e| ReadError::Unreadable(e.to_string()))?;
+fn mp4_kind(path: &Path, opener: &Opener) -> Result<(FileKind, bool), ReadError> {
+    let mut f = opener(path).map_err(|e| ReadError::Unreadable(e.to_string()))?;
     let opts = ParseOptions::new()
         .parsing_mode(ParsingMode::Relaxed)
         .read_tags(false);
@@ -207,9 +210,13 @@ pub struct FileTags {
     pub drm: bool,
 }
 
-fn open(path: &Path, opts: ParseOptions) -> Result<lofty::file::TaggedFile, String> {
-    Probe::open(path)
-        .map_err(|e| e.to_string())?
+fn open(
+    path: &Path,
+    opener: &Opener,
+    opts: ParseOptions,
+) -> Result<lofty::file::TaggedFile, String> {
+    let file = opener(path).map_err(|e| e.to_string())?;
+    Probe::new(std::io::BufReader::new(file))
         .options(opts)
         .guess_file_type()
         .map_err(|e| e.to_string())?
@@ -224,11 +231,18 @@ fn open(path: &Path, opts: ParseOptions) -> Result<lofty::file::TaggedFile, Stri
 /// parsed the file is read without them and indexed by its file name; the
 /// card gets the file as it is, tags included.
 pub fn read(path: &Path) -> Result<FileTags, ReadError> {
+    read_with(path, &|p: &Path| File::open(p))
+}
+
+/// [`read`], opening the file with `opener` (a card file is opened so its
+/// access time is left alone).
+pub fn read_with(path: &Path, opener: &Opener) -> Result<FileTags, ReadError> {
     let relaxed = ParseOptions::new().parsing_mode(ParsingMode::Relaxed);
-    let (tagged, tag_error) = match open(path, relaxed) {
+    let (tagged, tag_error) = match open(path, opener, relaxed) {
         Ok(t) => (t, None),
         Err(e) => match open(
             path,
+            opener,
             ParseOptions::new()
                 .parsing_mode(ParsingMode::Relaxed)
                 .read_tags(false),
@@ -241,7 +255,7 @@ pub fn read(path: &Path) -> Result<FileTags, ReadError> {
     let kind = match tagged.file_type() {
         FileType::Mpeg => FileKind::Mp3,
         FileType::Mp4 => {
-            let (kind, protected) = mp4_kind(path)?;
+            let (kind, protected) = mp4_kind(path, opener)?;
             drm = protected;
             kind
         }

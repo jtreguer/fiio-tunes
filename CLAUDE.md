@@ -14,9 +14,9 @@ its behaviour must stay identical to iprune's.
 
 ## Status
 
-F0 to F2 done (workspace, forked crates, `init`, `scan`, `playlist`, `import`,
-detection, `device info`, card reading, naming, `probe`; the probe not yet run
-on the X3). Milestones in
+F0 to F3 done (workspace, forked crates, `init`, `scan`, `playlist`, `import`,
+detection, `device info`, card reading, naming, `probe`, `adopt`; the probe
+not yet run on the X3, nor `adopt` on its card). Milestones in
 `docs/technical.md` section 16:
 
 | # | Deliverable | Writes to the card |

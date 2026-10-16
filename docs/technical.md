@@ -232,7 +232,8 @@ collides with another's, and `.m3u8`.
 
 ## 10. Adoption
 
-`adopt::run` (read only) over the card's audio files and the index:
+`adoption::run` (read only; the matcher itself is `adopt.rs`, shared with
+import) over the card's audio files and the index:
 
 1. Same size and same BLAKE3 as exactly one library file: accepted. As
    several (duplicates in the library): a duplicate proposal, the first as
@@ -250,6 +251,28 @@ first sync copies again those whose content differs and moves the others into
 name passes. `adopt-report.txt`, `--accept-proposals`, `--force`, and an empty
 card adopting with nothing to match, as in iprune. Adoption writes nothing to
 the card.
+
+How it reads the card: every card file a library file has the size of is
+hashed; tags are read (lofty, as the scan) only from the files no library
+file is identical to, and a file with no title tag is titled by its file
+name, as the library is. Every file matched or proposed is hashed, since its
+mapping records the card file's hash. Files are opened with `O_NOATIME`.
+Formats the scan does not index (by extension: WMA, DSD, Opus...) are
+neither read nor matched and stay unmanaged; files that cannot be read are
+listed in the report, once. The size recorded with a file is the number of
+bytes its hash was taken over. The card lock is held while the card is read.
+
+Only the `.m3u8` files of `[card] playlists_dir` (the card root by default)
+are matched to library playlists; others are unmanaged.
+
+Identity: the device key is `usb:<serial>`; a folder used as a card
+(`allow_folder`) takes the key in its manifest, or `folder:<path>` when it
+has none. A manifest of the same key gives its `card_id` to `devices`; with
+no manifest `card_id` is cleared, so the first sync makes a new one (9.1).
+A manifest of another key, or one that cannot be parsed, refuses the
+adoption: the owner moves it aside. Two card files or playlists FAT would take
+for one (only a folder can hold them) are mapped once, the first. A
+re-adoption through a folder keeps the device's name and model.
 
 ## 11. Sync
 

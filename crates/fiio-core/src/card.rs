@@ -172,22 +172,29 @@ fn walk(dir: OwnedFd, prefix: &str, out: &mut Contents) {
     }
 }
 
-/// BLAKE3 of the file at `path` as stored, not as cached: its pages are
-/// dropped from the page cache first, so the bytes come from the card.
-/// The file must have been synced (`sync_all`), or its dirty pages stay.
-pub fn read_back(path: &Path) -> std::io::Result<[u8; 32]> {
+/// Opens a file of the card for reading without updating its access time.
+/// `O_NOATIME` needs the caller to own it (on vfat, the `uid=` mount
+/// option); otherwise a plain open.
+pub fn open_file(path: &Path) -> std::io::Result<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
     let noatime = OFlags::NOATIME.bits() as i32;
-    let f = match std::fs::OpenOptions::new()
+    match std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(noatime)
         .open(path)
     {
         Err(e) if e.raw_os_error() == Some(rustix::io::Errno::PERM.raw_os_error()) => {
-            std::fs::File::open(path)?
+            std::fs::File::open(path)
         }
-        r => r?,
-    };
+        r => r,
+    }
+}
+
+/// BLAKE3 of the file at `path` as stored, not as cached: its pages are
+/// dropped from the page cache first, so the bytes come from the card.
+/// The file must have been synced (`sync_all`), or its dirty pages stay.
+pub fn read_back(path: &Path) -> std::io::Result<[u8; 32]> {
+    let f = open_file(path)?;
     rustix::fs::fadvise(&f, 0, None, rustix::fs::Advice::DontNeed)?;
     crate::scan::hash_reader(f)
 }

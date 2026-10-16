@@ -390,24 +390,6 @@ impl Ipod {
     }
 }
 
-/// Opens an iPod file for reading without updating its access time, so
-/// reading leaves the device untouched. `O_NOATIME` needs the caller to own
-/// the file (on vfat, the `uid=` mount option); otherwise a plain open.
-fn open_untouched(path: &Path) -> std::io::Result<std::fs::File> {
-    use std::os::unix::fs::OpenOptionsExt;
-    let noatime = rustix::fs::OFlags::NOATIME.bits() as i32;
-    match std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(noatime)
-        .open(path)
-    {
-        Err(e) if e.raw_os_error() == Some(rustix::io::Errno::PERM.raw_os_error()) => {
-            std::fs::File::open(path)
-        }
-        r => r,
-    }
-}
-
 /// Hashes the iPod files of `dbids`, one at a time: the iPod is a single
 /// disk. Reports `(done, total)` after each file.
 fn hash_ipod_files(
@@ -427,7 +409,7 @@ fn hash_ipod_files(
     let mut done = 0;
     for t in tracks.iter_mut().filter(|t| wanted.contains(&t.key)) {
         let file = paths[&t.key].and_then(|p| ipod::file_path(mountpoint, p));
-        match file.map(|f| open_untouched(&f).and_then(crate::scan::hash_reader)) {
+        match file.map(|f| crate::card::open_file(&f).and_then(crate::scan::hash_reader)) {
             Some(Ok(h)) => t.hash = Some(h),
             Some(Err(e)) => unreadable.push((t.key, e.to_string())),
             None => unreadable.push((t.key, "no usable path in the iPod database".into())),

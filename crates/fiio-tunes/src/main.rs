@@ -55,6 +55,17 @@ enum Command {
     /// The X3 and its card.
     #[command(subcommand)]
     Device(DeviceCommand),
+    /// Match the files and playlists already on the card to the library.
+    /// Writes nothing to the card.
+    Adopt {
+        /// Take the default of every proposal instead of saving nothing
+        /// while some are pending.
+        #[arg(long)]
+        accept_proposals: bool,
+        /// Replace the mappings of an earlier adoption.
+        #[arg(long)]
+        force: bool,
+    },
     /// Write test playlists to the card, to see which forms the X3 plays.
     Probe {
         /// Remove the probe's files from the card instead.
@@ -869,6 +880,61 @@ fn probe(clean: bool, yes: bool) -> Result<Outcome> {
     Ok(Outcome::Done)
 }
 
+fn adopt(accept_proposals: bool, force: bool) -> Result<()> {
+    use fiio_core::adoption;
+    let (config, store) = load()?;
+    let paths = paths()?;
+    let conn = store.conn();
+    playlists::sync_from_disk(conn, &config, false)?;
+    let found = fiio_core::device::locate(&config)?;
+    let card = found.mount.mountpoint.clone();
+    // Held while the card is read, so a sync cannot change it meanwhile.
+    let _lock = fiio_core::lock::card(&paths)?;
+    let manifest = fiio_core::manifest::identity(&card)?;
+    let key = adoption::device_key(&found, manifest.as_ref(), config.device.allow_folder)?;
+    eprintln!("reading the card at {}", card.display());
+    let tty = io::stderr().is_terminal();
+    let progress = |done: usize, total: usize| {
+        if tty {
+            eprint!("\rreading card files {done}/{total}      ");
+            if done == total {
+                eprintln!();
+            }
+        }
+    };
+    let run = adoption::run(conn, &config, &card, &key, accept_proposals, &progress)?;
+    let report_path = paths.data_dir.join("adopt-report.txt");
+    std::fs::create_dir_all(&paths.data_dir)?;
+    std::fs::write(&report_path, adoption::report(&run))
+        .with_context(|| format!("writing {}", report_path.display()))?;
+    println!("{}", adoption::summary(&run));
+    println!("full report: {}", report_path.display());
+    if !accept_proposals && !run.adoption.proposals.is_empty() {
+        println!(
+            "{} proposals need a decision: review the report, then run again with \
+             --accept-proposals. Nothing saved",
+            run.adoption.proposals.len()
+        );
+        return Ok(());
+    }
+    let usb = found.usb.as_ref();
+    let name = usb.and_then(|u| u.name.clone());
+    let model = usb.map(|u| {
+        format!(
+            "{} {}",
+            u.manufacturer.as_deref().unwrap_or("FiiO"),
+            u.name.as_deref().unwrap_or("X3")
+        )
+    });
+    adoption::save(conn, &run, name.as_deref(), model.as_deref(), force)?;
+    println!(
+        "saved: {} tracks and {} playlists mapped to {key}; nothing on the card changed",
+        run.mapping.len(),
+        run.playlists.matched.len()
+    );
+    Ok(())
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let result = match &cli.command {
@@ -903,6 +969,10 @@ fn main() -> ExitCode {
         .map(|()| Outcome::Done),
         Command::Device(DeviceCommand::Info) => device_info().map(|()| Outcome::Done),
         Command::Probe { clean, yes } => probe(*clean, *yes),
+        Command::Adopt {
+            accept_proposals,
+            force,
+        } => adopt(*accept_proposals, *force).map(|()| Outcome::Done),
     };
     match result {
         Ok(Outcome::Done) => ExitCode::SUCCESS,

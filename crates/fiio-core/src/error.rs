@@ -65,6 +65,16 @@ pub enum Error {
         .0.display()
     )]
     ProbeElsewhere(PathBuf),
+    #[error("{} is not an X3's card; adopt works on the card of a connected X3", .0.display())]
+    NotAnX3(PathBuf),
+    #[error("{} cannot be read: {}; move it aside to adopt this card", .0.display(), .1)]
+    BadManifest(PathBuf, String),
+    #[error(
+        "the card holds the manifest of another player ({found}, not {key}); move .fiio-tunes/manifest.json aside to adopt it for this one"
+    )]
+    ForeignManifest { found: String, key: String },
+    #[error("{0} was adopted already; run again with --force to replace its mappings")]
+    AlreadyAdopted(String),
     /// A file written to the card reads back wrong: exit code 3.
     #[error("verification failed: {0}")]
     VerifyFailed(String),

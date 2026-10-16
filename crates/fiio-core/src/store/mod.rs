@@ -2,6 +2,8 @@
 //! on each card: deleting it loses only those mappings, which adopting the
 //! card again rebuilds.
 
+pub mod devices;
+
 use std::path::{Path, PathBuf};
 
 use rusqlite::{Connection, OptionalExtension, Row, params};

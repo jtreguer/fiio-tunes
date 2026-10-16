@@ -356,3 +356,149 @@ fn target_tmp() -> &'static Path {
             .unwrap_or(concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/tmp")),
     )
 }
+
+/// A card that is a folder, and a way to prove nothing touched it. It
+/// remembers every file put on it. [`FakeCard::age`] gives every entry the
+/// same old access time and a newer modification time (a plain read would
+/// then update the access time even under relatime), and
+/// [`FakeCard::assert_untouched`] checks bytes, modification times, access
+/// times and the set of entries against what was put there.
+pub struct FakeCard {
+    pub root: PathBuf,
+    files: std::collections::BTreeMap<String, Vec<u8>>,
+    control: PathBuf,
+    atime_tracked: bool,
+}
+
+const OLD_ATIME: u64 = 1_000_000;
+const OLD_MTIME: u64 = 2_000_000;
+
+impl FakeCard {
+    /// `root` is an existing, empty folder. A control file is made next to
+    /// it (`root/../atime-control`), which is not part of the card.
+    pub fn new(root: PathBuf) -> Self {
+        let control = root.parent().unwrap().join("atime-control");
+        fs::write(&control, b"c").unwrap();
+        FakeCard {
+            root,
+            files: Default::default(),
+            control,
+            atime_tracked: true,
+        }
+    }
+
+    pub fn put(&mut self, rel: &str, bytes: &[u8]) {
+        let p = self.root.join(rel);
+        fs::create_dir_all(p.parent().unwrap()).unwrap();
+        fs::write(&p, bytes).unwrap();
+        self.files.insert(rel.to_owned(), bytes.to_vec());
+    }
+
+    /// Copies a fixture to `rel`.
+    pub fn copy(&mut self, rel: &str, kind: Kind, variant: u32) {
+        self.put(rel, &fs::read(fixture(kind, variant)).unwrap());
+    }
+
+    pub fn remove(&mut self, rel: &str) {
+        fs::remove_file(self.root.join(rel)).unwrap();
+        self.files.remove(rel);
+    }
+
+    /// Every entry's relative path, folders included, and the root as "".
+    fn entries(&self) -> std::collections::BTreeSet<String> {
+        let mut all = std::collections::BTreeSet::new();
+        all.insert(String::new());
+        for f in self.files.keys() {
+            all.insert(f.clone());
+            let mut p = Path::new(f).parent();
+            while let Some(d) = p.filter(|d| !d.as_os_str().is_empty()) {
+                all.insert(d.to_str().unwrap().to_owned());
+                p = d.parent();
+            }
+        }
+        all
+    }
+
+    fn set_times(path: &Path) {
+        use std::time::{Duration, UNIX_EPOCH};
+        let f = fs::File::open(path).unwrap();
+        f.set_times(
+            fs::FileTimes::new()
+                .set_accessed(UNIX_EPOCH + Duration::from_secs(OLD_ATIME))
+                .set_modified(UNIX_EPOCH + Duration::from_secs(OLD_MTIME)),
+        )
+        .unwrap();
+    }
+
+    /// Gives every entry the old times, and checks that this file system
+    /// moves an access time on a plain read, which the later check needs.
+    pub fn age(&mut self) {
+        use std::os::unix::fs::MetadataExt;
+        for rel in self.entries() {
+            Self::set_times(&self.root.join(rel));
+        }
+        Self::set_times(&self.control);
+        let _ = fs::read(&self.control).unwrap();
+        self.atime_tracked = fs::metadata(&self.control).unwrap().atime() != OLD_ATIME as i64;
+        Self::set_times(&self.control);
+    }
+
+    /// Nothing on the card changed since [`FakeCard::age`]: same bytes, same
+    /// times, no entry added or removed. Ages the card again afterwards (the
+    /// check lists folders the plain way).
+    pub fn assert_untouched(&mut self) {
+        use std::io::Read;
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+        for rel in self.entries() {
+            let p = self.root.join(&rel);
+            let md = fs::metadata(&p).unwrap();
+            let shown = if rel.is_empty() {
+                "the card root"
+            } else {
+                &rel
+            };
+            assert_eq!(md.mtime(), OLD_MTIME as i64, "{shown}: modified");
+            if self.atime_tracked {
+                assert_eq!(md.atime(), OLD_ATIME as i64, "{shown}: read the plain way");
+            } else {
+                eprintln!("atime check skipped: file system does not update atime");
+            }
+            if let Some(want) = self.files.get(&rel) {
+                // O_NOATIME, so checking does not move the access time.
+                let mut f = fs::OpenOptions::new()
+                    .read(true)
+                    .custom_flags(0o1_000_000)
+                    .open(&p)
+                    .unwrap();
+                let mut got = Vec::new();
+                f.read_to_end(&mut got).unwrap();
+                assert!(&got == want, "{shown}: bytes changed");
+            }
+        }
+        let mut found = std::collections::BTreeSet::new();
+        found.insert(String::new());
+        let mut stack = vec![self.root.clone()];
+        while let Some(d) = stack.pop() {
+            for e in fs::read_dir(&d).unwrap() {
+                let e = e.unwrap();
+                let rel = e
+                    .path()
+                    .strip_prefix(&self.root)
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .to_owned();
+                if e.file_type().unwrap().is_dir() {
+                    stack.push(e.path());
+                }
+                found.insert(rel);
+            }
+        }
+        assert_eq!(
+            found,
+            self.entries(),
+            "entries added to or removed from the card"
+        );
+        self.age();
+    }
+}
