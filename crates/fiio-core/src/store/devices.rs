@@ -147,6 +147,51 @@ pub fn replace_mappings(
     })
 }
 
+/// Replaces the device's track mappings, leaving its playlist mappings as
+/// they are.
+pub fn replace_track_mappings(
+    conn: &Connection,
+    device_id: i64,
+    tracks: &[TrackMapping],
+) -> Result<()> {
+    crate::store::savepoint(conn, || {
+        conn.execute(
+            "DELETE FROM device_tracks WHERE device_id = ?1",
+            [device_id],
+        )?;
+        let mut stmt = conn.prepare(
+            "INSERT INTO device_tracks (device_id, track_id, card_path, card_key, synced_hash, synced_size) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        )?;
+        for m in tracks {
+            stmt.execute(params![
+                device_id,
+                m.track_id,
+                m.card_path,
+                card_key(&m.card_path),
+                &m.synced_hash[..],
+                m.synced_size as i64
+            ])?;
+        }
+        Ok(())
+    })
+}
+
+/// Records that the card file of `track_id` is now at `card_path`.
+pub fn set_card_path(
+    conn: &Connection,
+    device_id: i64,
+    track_id: i64,
+    card_path: &str,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE device_tracks SET card_path = ?3, card_key = ?4 \
+         WHERE device_id = ?1 AND track_id = ?2",
+        params![device_id, track_id, card_path, card_key(card_path)],
+    )?;
+    Ok(())
+}
+
 pub fn track_mappings(conn: &Connection, device_id: i64) -> Result<Vec<TrackMapping>> {
     let mut stmt = conn.prepare(
         "SELECT track_id, card_path, synced_hash, synced_size FROM device_tracks \

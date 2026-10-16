@@ -1,6 +1,5 @@
 //! Preparing a sync: gather what the planner needs from the index and the
-//! card, run it, and describe the plan. Writing to the card comes later
-//! (F5, F6).
+//! card, run it, and describe the plan. `exec` writes it.
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -34,6 +33,9 @@ pub struct Prepared {
     pub library: HashMap<i64, TrackRow>,
     /// The scope used, and whether it is the device's own.
     pub scope: (DeviceScope, bool),
+    /// Card files a sync cut short left in place unrecorded, mapped again
+    /// before planning.
+    pub taken_back: usize,
 }
 
 /// Refuses a card that is not the one adopted for `device` (section 9.1):
@@ -207,10 +209,17 @@ pub fn prepare_with(
             .collect();
         return Err(Error::CardIncomplete(list.join("; ")));
     }
+    if !contents.hops.is_empty() {
+        return Err(Error::StoppedMidMove(contents.hops.len()));
+    }
     let manifest = manifest::identity(&card)?;
     let key = crate::adoption::device_key(found, manifest.as_ref(), cfg.device.allow_folder)?;
     let device = devices::device(conn, &key)?.ok_or_else(|| Error::NotAdopted(key.clone()))?;
     check_card(&device, manifest.as_ref())?;
+    if let Some(stamp) = devices::restoring(conn, device.id)? {
+        return Err(Error::RestoreUnfinished(stamp));
+    }
+    let taken_back = take_back(conn, cfg, &device, &card, &contents)?;
     // Without a mapping every song already on the card would be copied a
     // second time; an empty card has nothing to copy twice.
     if devices::mapped_count(conn, device.id)? == 0 && !contents.audio.is_empty() {
@@ -219,9 +228,109 @@ pub fn prepare_with(
             files: contents.audio.len(),
         });
     }
-    if let Some(stamp) = devices::restoring(conn, device.id)? {
-        return Err(Error::RestoreUnfinished(stamp));
+    let mut p = plan_card(conn, cfg, card, contents, device, playlists_only)?;
+    p.taken_back = taken_back;
+    Ok(p)
+}
+
+fn layout(cfg: &Config) -> Layout<'_> {
+    Layout {
+        music_dir: &cfg.card.music_dir,
+        playlists_dir: &cfg.card.playlists_dir,
+        roots: &cfg.library.roots,
     }
+}
+
+/// The card files a sync left where the library puts them without
+/// recording them (it was cut short between two checkpoints, or a restore
+/// put back older mappings): an unmanaged file at a present track's card
+/// path, of the track's size and content, when the track has no mapping or
+/// its mapped file is gone. Only those files are read. Writes nothing.
+pub fn takeable(
+    conn: &Connection,
+    cfg: &Config,
+    device: &DeviceRow,
+    card: &Path,
+    contents: &Contents,
+) -> Result<Vec<devices::TrackMapping>> {
+    let library = store::all_tracks(conn)?;
+    let mappings = devices::track_mappings(conn, device.id)?;
+    let audio: HashMap<String, &card::CardFile> = contents
+        .audio
+        .iter()
+        .map(|f| (card_key(&f.path), f))
+        .collect();
+    let mapped: HashMap<i64, &devices::TrackMapping> =
+        mappings.iter().map(|m| (m.track_id, m)).collect();
+    let keys: std::collections::HashSet<String> =
+        mappings.iter().map(|m| card_key(&m.card_path)).collect();
+    let mut taken = Vec::new();
+    let targets = plan::targets(&library, layout(cfg));
+    for t in library.iter().filter(|t| targets.contains_key(&t.id)) {
+        let key = card_key(&targets[&t.id]);
+        let Some(f) = audio.get(&key) else { continue };
+        let placed = mapped
+            .get(&t.id)
+            .is_some_and(|m| audio.contains_key(&card_key(&m.card_path)));
+        if keys.contains(&key) || placed || f.size != t.size {
+            continue;
+        }
+        let p = card.join(&f.path);
+        let hash = card::open_file(&p)
+            .and_then(crate::scan::hash_reader)
+            .map_err(|source| Error::Io { path: p, source })?;
+        if hash == t.hash {
+            taken.push(devices::TrackMapping {
+                track_id: t.id,
+                card_path: f.path.clone(),
+                synced_hash: hash,
+                synced_size: f.size,
+            });
+        }
+    }
+    Ok(taken)
+}
+
+/// Records the mappings `taken` ([`takeable`]) in place of the tracks' own.
+pub fn record_taken(
+    conn: &Connection,
+    device: &DeviceRow,
+    taken: &[devices::TrackMapping],
+) -> Result<()> {
+    if taken.is_empty() {
+        return Ok(());
+    }
+    let mut all: Vec<devices::TrackMapping> = devices::track_mappings(conn, device.id)?
+        .into_iter()
+        .filter(|m| !taken.iter().any(|t| t.track_id == m.track_id))
+        .collect();
+    all.extend_from_slice(taken);
+    devices::replace_track_mappings(conn, device.id, &all)
+}
+
+/// Maps again the files [`takeable`] finds; returns how many.
+pub fn take_back(
+    conn: &Connection,
+    cfg: &Config,
+    device: &DeviceRow,
+    card: &Path,
+    contents: &Contents,
+) -> Result<usize> {
+    let taken = takeable(conn, cfg, device, card, contents)?;
+    record_taken(conn, device, &taken)?;
+    Ok(taken.len())
+}
+
+/// Plans a sync of the card at `card`, listed as `contents`, for the
+/// adopted `device`, once the card's identity has been checked.
+pub fn plan_card(
+    conn: &Connection,
+    cfg: &Config,
+    card: PathBuf,
+    contents: Contents,
+    device: DeviceRow,
+    playlists_only: bool,
+) -> Result<Prepared> {
     let library = store::all_tracks(conn)?;
     let playlists = devices::library_playlists(conn)?;
     let removed = store::removed_playlists(conn)?;
@@ -247,11 +356,7 @@ pub fn prepare_with(
         scope: selection.as_plan(),
         remove_unmanaged: cfg.sync.remove_unmanaged,
         space: Some(Space { capacity, free }),
-        layout: Layout {
-            music_dir: &cfg.card.music_dir,
-            playlists_dir: &cfg.card.playlists_dir,
-            roots: &cfg.library.roots,
-        },
+        layout: layout(cfg),
         card_playlists: &card_playlists,
         playlists_only,
     });
@@ -264,6 +369,7 @@ pub fn prepare_with(
         playlists_map,
         library: library.into_iter().map(|t| (t.id, t)).collect(),
         scope: (selection, own),
+        taken_back: 0,
     })
 }
 

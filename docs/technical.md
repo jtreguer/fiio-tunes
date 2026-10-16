@@ -372,8 +372,7 @@ Decisions taken in F5, which applies playlists only:
   planner's `playlists_only`): managed files stay where they are, the
   playlists name the files on the card now, and entries whose track is not
   there yet are left out and reported. It stays as an option once tracks
-  are synced. Until F6, `sync` without it or `--plan-only` is refused, and
-  the executor refuses a plan with track changes.
+  are synced. (Until F6, `sync` without it or `--plan-only` was refused.)
 - Refused before asking: track changes (F5), a plan that does not fit,
   mass removals of tracks, or of playlist files (more than five and more
   than a tenth of the managed playlists; unmanaged ones `remove_unmanaged`
@@ -385,7 +384,7 @@ Decisions taken in F5, which applies playlists only:
 - The backup holds every `.m3u8` on the card under `playlists/<card path>`,
   `manifest.json` when there is one, `mappings.json` (device key, card id,
   track mappings with hashes, playlist mappings with the library names),
-  `plan.json`, `work.json` (`[]` until F6 logs copies) and `listing.txt`
+  `plan.json`, `work.json` (F6: the track operations) and `listing.txt`
   (path and size of each audio and `.m3u8` file). The folder is
   `backups/<key>/`, the key with characters other than letters, digits,
   `.`, `-` and `_` made `_`.
@@ -409,6 +408,49 @@ Decisions taken in F5, which applies playlists only:
   are warnings, not failures.
 - `mappings.json` also records `[card] playlists_dir`, so a restore finds
   the playlists where they were.
+
+Decisions taken in F6, which applies the whole plan:
+
+- A copy reads the library file once, hashing what it writes to
+  `<dir>/.fiio-tunes-<n>.part` (`n` the first free number). A file whose
+  bytes are not what the scan indexed (size or BLAKE3) is skipped as
+  changed since the scan, like one gone or unreadable; the next scan and
+  sync take it. A new copy never lands on a file that appeared since the
+  plan (`WouldOverwrite`); a copy again is renamed over the old file.
+  Folders under `music_dir` that a removal, a move or a skipped copy left
+  empty are removed.
+- When a copy was skipped, the playlists are planned again from the card
+  after the copies (the planner's `playlists_only`), so they leave that
+  track out, and the check expects the new track absent and a file copied
+  again at its old size.
+- The mappings follow the card. They are recorded once the removals are
+  done (mappings whose file is gone are dropped then), after every move (a
+  cycle's hop under its hidden name, so the name it frees is free in the
+  record too), every 500 copies or 10 minutes, at the end of the copies, and
+  when the card fails. Every record but those of single moves rewrites the
+  manifest; a manifest that cannot be written then stops the sync.
+- Take-back: `prepare`, and `doctor`, map again an unmanaged file at a
+  present track's card path, of the track's size and BLAKE3, when the track
+  has no mapping or its mapped file is gone. A sync killed between two
+  checkpoints, or a restore of older mappings, so loses at most the file in
+  flight. Only those files are read. A file the owner put at exactly that
+  path with exactly the library's bytes is taken for fiio-tunes' own, and
+  goes with the track if it leaves the scope.
+- A plan whose only change is a mapping whose file is gone is not empty:
+  the sync drops it, backs up and rewrites the manifest.
+- `prepare` refuses a card holding a cycle's hidden file
+  (`.fiio-tunes-move-<n>`): `doctor --fix` puts it in place first. Leftover
+  `.part` files are only mentioned; `doctor --fix` deletes them.
+- Ctrl+C, SIGTERM and SIGHUP end fiio-tunes at once until it applies a
+  confirmed command; from then on (`sync`, `restore`, `doctor --fix`) they
+  only ask it to stop, as in iprune. A stopped sync finishes the file in
+  flight, records what was done, rewrites the manifest and checks the card
+  against the plan less the copies not made, with every playlist file as it
+  was. The playlists are left for the next sync, and the command exits 1
+  saying so.
+- `work.json` holds the track operations in the order they are applied
+  (`remove`, `moves`, `copy`, `replace`), written with the backup before
+  any.
 
 `restore <stamp>` refuses a card that is not the one the backup or the
 index names: its manifest's card id must be the index's or the backup's;
@@ -449,6 +491,34 @@ hops of a move cycle left (renamed to the path the work log gives them),
 card audio no mapping names (moved to
 `.fiio-tunes/orphans/<stamp>/`), mappings whose file is gone (dropped), library
 rows missing for 30 days and on no device (dropped).
+
+Decisions taken in F6:
+
+- `doctor` refuses a card listing with problems, a card that is not the
+  one adopted, and an unfinished restore. It also reports the files a
+  take-back (11.2) would map, and `--fix` maps them.
+- Orphans are the unmanaged audio files under `[card] music_dir` that
+  fiio-tunes managed or wrote by its backups (a path in a backup's
+  `mappings.json`, or a copy or move target in its `work.json`), moved to
+  `.fiio-tunes/orphans/<stamp>/<card path>`. Any other unmanaged file is
+  the owner's, kept as the rules say; only a sync's report names it. A
+  file the owner later puts at a path a backup names is taken for one
+  fiio-tunes wrote.
+- The hops are renamed on the card first, then every mapping change (hops
+  followed, stale ones dropped, files taken back) is one write, so no step
+  holds a card name twice. Paths read from a backup must be plain relative
+  paths (no `..`, no root, no empty part), or that move is ignored.
+- A hidden hop's source and target come from the newest backup that lists
+  the move: `work.json` for a track, the renames of `plan.json` for a
+  playlist. A track hop whose mapping names it goes on to its target when
+  that is free, else back to its source, and its mapping follows. Any other
+  hop (a playlist, or a track whose move was not recorded) goes back to its
+  source when free, else to its target. With neither free, or no backup
+  that knows it, it is reported and left.
+- `--fix` scans the library first (a failed scan forgets no track), backs
+  up the card's playlists, manifest and mappings before it changes the
+  card, and rewrites the manifest when the card has an id. There is no
+  mass guard: orphans are moved on the card, not deleted.
 
 ## 12. Import
 

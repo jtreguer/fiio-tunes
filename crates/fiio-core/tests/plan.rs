@@ -176,6 +176,7 @@ impl World {
             playlists: self.card_lists.clone(),
             problems: vec![],
             manifest: false,
+            ..Contents::default()
         };
         plan::plan(&PlanInput {
             library: &self.lib,
@@ -1290,7 +1291,7 @@ fn mass_removal_needs_more_than_five_and_more_than_a_tenth() {
 }
 
 // Prevents: is_empty ignoring one kind of change, or counting what changes
-// nothing (skips, unmanaged files, stale mappings).
+// nothing (skips, unmanaged files); a stale mapping counts, the sync drops it.
 #[test]
 fn is_empty_looks_at_every_kind_of_change() {
     assert!(Plan::default().is_empty());
@@ -1339,11 +1340,15 @@ fn is_empty_looks_at_every_kind_of_change() {
         reason: SkipReason::FairPlay,
     });
     p.unmanaged.files.push("u".into());
-    p.stale_mappings.push(plan::StaleMapping {
-        track_id: 1,
-        card_path: "a".into(),
-    });
     assert!(p.is_empty());
+    // A mapping whose file is gone is a change of the record: the sync
+    // drops it.
+    one(|p| {
+        p.stale_mappings.push(plan::StaleMapping {
+            track_id: 1,
+            card_path: "a".into(),
+        })
+    });
 }
 
 // ------------------------------------------------- determinism, idempotence

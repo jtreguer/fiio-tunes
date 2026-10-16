@@ -36,6 +36,12 @@ pub struct Contents {
     pub problems: Vec<(String, String)>,
     /// Whether `.fiio-tunes/manifest.json` is there.
     pub manifest: bool,
+    /// Hidden files a sync cut short left: copies not finished
+    /// (`.fiio-tunes-<n>.part`), sorted by path.
+    pub parts: Vec<String>,
+    /// Files a sync stopped between the two renames of a cycle left under
+    /// a hidden name (`.fiio-tunes-move-<n>.move` or `.m3u8`), sorted.
+    pub hops: Vec<String>,
 }
 
 impl Contents {
@@ -48,6 +54,32 @@ impl Contents {
 /// `.fiio-tunes`, macOS' `._` files) and Windows' system folder.
 fn skipped(name: &str) -> bool {
     name.starts_with('.') || name.eq_ignore_ascii_case("System Volume Information")
+}
+
+/// What a hidden file a sync left is, if it is one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Leftover {
+    /// A copy not finished: `.fiio-tunes-<n>.part`.
+    Part,
+    /// A file between the two renames of a cycle:
+    /// `.fiio-tunes-move-<n>.move`, or `.m3u8` for a playlist.
+    Hop,
+}
+
+/// The temp name of the `n`-th copy into a folder.
+pub fn part_name(n: usize) -> String {
+    format!(".fiio-tunes-{n}.part")
+}
+
+/// Whether `name` is a leftover of a sync, and which kind.
+pub fn leftover(name: &str) -> Option<Leftover> {
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    if let Some(rest) = name.strip_prefix(".fiio-tunes-move-") {
+        let (n, ext) = rest.split_once('.')?;
+        return (digits(n) && (ext == "move" || ext == "m3u8")).then_some(Leftover::Hop);
+    }
+    let n = name.strip_prefix(".fiio-tunes-")?.strip_suffix(".part")?;
+    digits(n).then_some(Leftover::Part)
 }
 
 fn extension(name: &str) -> Option<String> {
@@ -100,6 +132,8 @@ pub fn read(root: &Path) -> Result<Contents> {
     walk(fd, "", &mut out);
     out.audio.sort_by(|a, b| a.path.cmp(&b.path));
     out.playlists.sort_by(|a, b| a.path.cmp(&b.path));
+    out.parts.sort();
+    out.hops.sort();
     Ok(out)
 }
 
@@ -129,6 +163,16 @@ fn walk(dir: OwnedFd, prefix: &str, out: &mut Contents) {
         }
         let lossy = raw.to_string_lossy();
         if skipped(&lossy) {
+            // Only regular files: a folder of that name is not one.
+            let kind = leftover(&lossy).filter(|_| {
+                rustix::fs::statat(&dir, raw, AtFlags::SYMLINK_NOFOLLOW)
+                    .is_ok_and(|st| FileType::from_raw_mode(st.st_mode) == FileType::RegularFile)
+            });
+            match kind {
+                Some(Leftover::Part) => out.parts.push(shown(&lossy)),
+                Some(Leftover::Hop) => out.hops.push(shown(&lossy)),
+                None => {}
+            }
             continue;
         }
         let st = match rustix::fs::statat(&dir, raw, AtFlags::SYMLINK_NOFOLLOW) {

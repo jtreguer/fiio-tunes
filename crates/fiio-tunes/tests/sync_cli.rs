@@ -213,24 +213,18 @@ fn copy_targets(plan: &Value) -> Vec<String> {
 
 // -------------------------------------------------------------- sync
 
-// Prevents: `sync` without --plan-only doing anything before F5 can write
-// safely: it must refuse, leave the card, the index and plan.json alone.
+// Prevents: `sync` writing to the card without a confirmation: with no
+// terminal to ask on and no --yes, it shows the plan, exits 1 and leaves
+// the card and the mappings alone.
 #[test]
-fn sync_without_plan_only_exits_1_and_writes_nothing() {
+fn sync_without_yes_and_no_terminal_writes_nothing() {
     let mut sb = Sandbox::adopted(2);
-    let before = sb.library_snapshot();
     let tracks = sb.count("device_tracks");
     let o = sb.run(&["sync"]);
     assert_code(&o, 1);
-    assert!(err(&o).contains("--plan-only"), "{}", err(&o));
-    assert!(out(&o).is_empty(), "{}", out(&o));
-    assert!(!sb.plan_file().exists());
+    assert!(err(&o).contains("--yes"), "{}", err(&o));
+    assert!(out(&o).contains("to copy"), "{}", out(&o));
     assert_eq!(sb.count("device_tracks"), tracks);
-    assert_eq!(sb.library_snapshot(), before);
-    // The other options do not make it write either.
-    let o = sb.run(&["sync", "--yes", "--allow-mass-removal"]);
-    assert_code(&o, 1);
-    assert!(!sb.plan_file().exists());
     sb.card.assert_untouched();
 }
 

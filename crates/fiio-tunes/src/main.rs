@@ -1,6 +1,7 @@
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -67,8 +68,7 @@ enum Command {
         force: bool,
     },
     /// Sync the card with the library: show the plan, ask, apply it and
-    /// check the card. This version writes playlists only
-    /// (--playlists-only); --plan-only shows the full plan.
+    /// check the card.
     Sync {
         /// Show the plan and save it to plan.json; change nothing.
         #[arg(long)]
@@ -111,6 +111,16 @@ enum Command {
     /// of the card. Audio files are left as they are.
     Restore {
         stamp: String,
+        /// Do not ask for confirmation.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Find what a sync cut short or another program left on the card or in
+    /// the index; with --fix, repair it.
+    Doctor {
+        /// Repair what is found, after asking.
+        #[arg(long)]
+        fix: bool,
         /// Do not ask for confirmation.
         #[arg(long)]
         yes: bool,
@@ -1012,13 +1022,6 @@ struct SyncArgs {
 }
 
 fn run_sync(args: SyncArgs) -> Result<Outcome> {
-    if !args.plan_only && !args.playlists_only {
-        bail!(
-            "this version writes playlists only: run `fiio-tunes sync --playlists-only`, or \
-             `fiio-tunes sync --plan-only` to see the full plan; copying tracks comes in a \
-             later version"
-        );
-    }
     let (config, mut store) = load()?;
     let paths = paths()?;
     let r = scan_with_progress(&config, &mut store)?;
@@ -1037,6 +1040,18 @@ fn run_sync(args: SyncArgs) -> Result<Outcome> {
     eprintln!("reading the card at {}", found.mount.mountpoint.display());
     let prepared =
         fiio_core::sync::prepare_with(store.conn(), &config, &found, args.playlists_only)?;
+    if prepared.taken_back > 0 {
+        eprintln!(
+            "{} files an interrupted sync left in place were taken back",
+            prepared.taken_back
+        );
+    }
+    if !prepared.contents.parts.is_empty() {
+        eprintln!(
+            "{} unfinished copies are on the card; `fiio-tunes doctor --fix` removes them",
+            prepared.contents.parts.len()
+        );
+    }
     let plan_json = serde_json::to_string_pretty(&prepared.plan)?;
     std::fs::create_dir_all(&paths.data_dir)?;
     let plan_path = paths.data_dir.join("plan.json");
@@ -1086,23 +1101,96 @@ fn run_sync(args: SyncArgs) -> Result<Outcome> {
     if !args.yes && !confirm("Apply?")? {
         return Ok(Outcome::Declined);
     }
-    let _inhibitor = fiio_core::inhibit::hold("Writing playlists to the X3's card");
-    match fiio_core::exec::run(store.conn(), &config, &paths, &found, &prepared, opts) {
+    let _inhibitor = applying("Writing to the X3's card");
+    let tty = io::stderr().is_terminal();
+    let progress = |p: fiio_core::exec::Progress| {
+        use fiio_core::exec::Progress;
+        if !tty {
+            return;
+        }
+        // Errors ignored: once the terminal is gone (SIGHUP), writing to it
+        // fails, and must not stop the sync.
+        let mut err = io::stderr();
+        let _ = match p {
+            Progress::Removing { done, total } => {
+                write!(err, "\r\x1b[Kremoving {}/{total}", done + 1)
+            }
+            Progress::Moving { done, total } => {
+                write!(err, "\r\x1b[Kmoving {}/{total}", done + 1)
+            }
+            Progress::Copying {
+                done,
+                total,
+                bytes,
+                bytes_total,
+                name,
+            } => write!(
+                err,
+                "\r\x1b[Kcopying {}/{total} ({} of {}) {name}",
+                done + 1,
+                fiio_core::sync::bytes(bytes),
+                fiio_core::sync::bytes(bytes_total)
+            ),
+            Progress::Playlists => write!(err, "\r\x1b[Kwriting the playlists…"),
+            Progress::Verifying => write!(err, "\r\x1b[Kreading the card again to check it…"),
+        };
+    };
+    let result = fiio_core::exec::run(
+        store.conn(),
+        &config,
+        &paths,
+        &found,
+        &prepared,
+        opts,
+        &progress,
+        &CANCEL,
+    );
+    if tty {
+        let _ = writeln!(io::stderr());
+    }
+    match result {
         Ok(done) => {
+            // Errors ignored: the card is written; a terminal gone must not
+            // turn that into a failure.
             let mut out = io::stdout().lock();
             if done.first {
-                writeln!(out, "the card was checked as adopted and got its id")?;
+                let _ = writeln!(out, "the card was checked as adopted and got its id");
             }
-            writeln!(
+            let _ = writeln!(
                 out,
-                "playlists: {} written, {} renamed, {} removed; the card checked as planned",
-                done.written, done.renamed, done.deleted
-            )?;
+                "tracks: {} copied ({}), {} copied again, {} moved, {} removed",
+                done.copied,
+                fiio_core::sync::bytes(done.bytes),
+                done.recopied,
+                done.moved,
+                done.removed
+            );
+            match done.stopped {
+                None => {
+                    let _ = writeln!(
+                        out,
+                        "playlists: {} written, {} renamed, {} removed; the card checked as planned",
+                        done.written, done.renamed, done.deleted
+                    );
+                }
+                Some(_) => {
+                    let _ = writeln!(out, "playlists: left for the next sync");
+                }
+            }
+            for (path, why) in &done.skipped {
+                let _ = writeln!(out, "not copied, {why}: {}", path.display());
+            }
             if let Some(b) = &done.backup {
-                writeln!(out, "backup: {}", b.stamp)?;
+                let _ = writeln!(out, "backup: {}", b.stamp);
             }
             for w in &done.warnings {
-                writeln!(out, "warning: {w}")?;
+                let _ = writeln!(out, "warning: {w}");
+            }
+            if let Some(why) = done.stopped {
+                bail!(
+                    "the sync stopped early ({why}); what was done is recorded and checked, and \
+                     the next sync goes on from there"
+                );
             }
             Ok(Outcome::Done)
         }
@@ -1110,7 +1198,7 @@ fn run_sync(args: SyncArgs) -> Result<Outcome> {
             let hint = match &failed.backup {
                 Some(b) => format!(
                     "the card was backed up as {} before writing; run `fiio-tunes restore {}` \
-                     before syncing again: it puts its playlists back",
+                     before syncing again: it puts its playlists and record back",
                     b.stamp, b.stamp
                 ),
                 None => "nothing was written to the card".into(),
@@ -1118,6 +1206,118 @@ fn run_sync(args: SyncArgs) -> Result<Outcome> {
             Err(anyhow::Error::new(failed.error).context(hint))
         }
     }
+}
+
+fn run_doctor(fix: bool, yes: bool) -> Result<Outcome> {
+    use fiio_core::doctor;
+    let (config, mut store) = load()?;
+    let paths = paths()?;
+    // A repair forgets long-missing tracks: the library is scanned first,
+    // so one whose file came back is not forgotten. If the scan fails (a
+    // disk not mounted), nothing is forgotten this time.
+    let scanned = !fix || {
+        match scan_with_progress(&config, &mut store) {
+            Ok(_) => true,
+            Err(e) => {
+                eprintln!(
+                    "the library could not be scanned ({e:#}); no track is forgotten this time"
+                );
+                false
+            }
+        }
+    };
+    let found = fiio_core::device::locate(&config)?;
+    let _lock = fiio_core::lock::card(&paths)?;
+    let mut examined = doctor::examine(store.conn(), &config, &paths, &found)?;
+    if !scanned {
+        examined.report.forgotten.clear();
+    }
+    let r = &examined.report;
+    let mut out = io::stdout().lock();
+    let card = examined.card.display();
+    let section = |out: &mut io::StdoutLock, title: &str, lines: Vec<String>| -> io::Result<()> {
+        if !lines.is_empty() {
+            writeln!(out, "{title} ({}):", lines.len())?;
+            for l in lines {
+                writeln!(out, "  {l}")?;
+            }
+        }
+        Ok(())
+    };
+    section(&mut out, "unfinished copies, to delete", r.parts.clone())?;
+    section(
+        &mut out,
+        "files left under a hidden name by a stopped sync",
+        r.hops
+            .iter()
+            .map(|h| match &h.to {
+                Some(to) => format!("{} -> {to}", h.path),
+                None => format!("{} (no free place known; move it by hand)", h.path),
+            })
+            .collect(),
+    )?;
+    section(
+        &mut out,
+        "files a stopped sync left in place, to record",
+        r.taken_back.iter().map(|m| m.card_path.clone()).collect(),
+    )?;
+    section(
+        &mut out,
+        "recorded files no longer on the card, to forget",
+        r.stale.iter().map(|(_, p)| p.clone()).collect(),
+    )?;
+    section(
+        &mut out,
+        &format!(
+            "files under {} fiio-tunes does not manage, to move to {}",
+            config.card.music_dir,
+            doctor::ORPHANS
+        ),
+        r.orphans.clone(),
+    )?;
+    section(
+        &mut out,
+        "library tracks missing for over 30 days, to drop from the index",
+        r.forgotten
+            .iter()
+            .map(|(_, p)| p.display().to_string())
+            .collect(),
+    )?;
+    if r.is_clean() {
+        writeln!(out, "nothing to repair on {card}")?;
+        return Ok(Outcome::Done);
+    }
+    if !fix {
+        writeln!(out, "run `fiio-tunes doctor --fix` to repair")?;
+        return Ok(Outcome::Done);
+    }
+    out.flush()?;
+    drop(out);
+    if !yes && !confirm(&format!("Repair {card}?"))? {
+        return Ok(Outcome::Declined);
+    }
+    let _inhibitor = applying("Repairing the X3's card");
+    let done = doctor::fix(store.conn(), &config, &paths, &found, &examined)?;
+    let mut out = io::stdout().lock();
+    let _ = writeln!(
+        out,
+        "removed {} unfinished copies, placed {} hidden files, recorded {}, forgot {} \
+         recorded files, moved {} orphans, dropped {} library tracks",
+        done.parts, done.hops, done.taken_back, done.stale, done.orphans, done.forgotten
+    );
+    if let Some(dir) = &done.orphans_dir {
+        let _ = writeln!(
+            out,
+            "orphans are in {dir} on the card; delete it to free the space"
+        );
+    }
+    if let Some(b) = &done.backup {
+        let _ = writeln!(out, "backup: {}", b.stamp);
+    }
+    for w in &done.warnings {
+        let _ = writeln!(out, "warning: {w}");
+    }
+    Ok(Outcome::Done)
 }
 
 fn run_backups(key: Option<&str>) -> Result<()> {
@@ -1167,7 +1367,7 @@ fn run_restore(stamp: &str, yes: bool) -> Result<Outcome> {
     if !yes && !confirm(&question)? {
         return Ok(Outcome::Declined);
     }
-    let _inhibitor = fiio_core::inhibit::hold("Restoring the X3's card");
+    let _inhibitor = applying("Restoring the X3's card");
     let r = fiio_core::restore::run(store.conn(), &config, &paths, &found, stamp).map_err(|e| {
         let restoring = fiio_core::store::devices::device(store.conn(), &key)
             .ok()
@@ -1285,7 +1485,49 @@ fn run_scope(set: Option<&ScopeCommand>, key: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+/// Set once a command starts changing the card or the index after its
+/// confirmation: a signal then asks it to stop at the next safe point
+/// instead of ending the process.
+static APPLYING: AtomicBool = AtomicBool::new(false);
+/// Asked to stop: copies end after the current file, and what was done is
+/// recorded and checked.
+static CANCEL: AtomicBool = AtomicBool::new(false);
+
+/// Ctrl+C, SIGTERM (logout, shutdown) and SIGHUP (the terminal closed) end
+/// fiio-tunes at once until it applies anything; from then on they only
+/// ask it to stop, and it never exits in the middle of a write. A copy that
+/// hangs is ended with `kill -9`, which leaves a `.part` file `fiio-tunes
+/// doctor` removes.
+fn install_signals() {
+    let _ = ctrlc::set_handler(|| {
+        if !APPLYING.load(Ordering::SeqCst) {
+            std::process::exit(130);
+        }
+        let msg = if CANCEL.swap(true, Ordering::SeqCst) {
+            "\nstill finishing: fiio-tunes stops once it is safe to"
+        } else {
+            "\nstopping as soon as it is safe to: what was done is recorded and checked first…"
+        };
+        let _ = writeln!(io::stderr(), "{msg}");
+    });
+}
+
+/// Marks the command as applying, and keeps the machine from suspending or
+/// shutting down until the returned inhibitor is dropped.
+fn applying(why: &str) -> Option<fiio_core::inhibit::Inhibitor> {
+    APPLYING.store(true, Ordering::SeqCst);
+    let held = fiio_core::inhibit::hold(why);
+    if held.is_none() {
+        let _ = writeln!(
+            io::stderr(),
+            "could not keep the machine from sleeping (systemd-inhibit): do not suspend it until this is done"
+        );
+    }
+    held
+}
+
 fn main() -> ExitCode {
+    install_signals();
     let cli = Cli::parse();
     let result = match &cli.command {
         Command::Init {
@@ -1336,6 +1578,7 @@ fn main() -> ExitCode {
         }),
         Command::Backups { device } => run_backups(device.as_deref()).map(|()| Outcome::Done),
         Command::Restore { stamp, yes } => run_restore(stamp, *yes),
+        Command::Doctor { fix, yes } => run_doctor(*fix, *yes),
         Command::Scope { set, device } => {
             run_scope(set.as_ref(), device.as_deref()).map(|()| Outcome::Done)
         }

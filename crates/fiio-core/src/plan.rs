@@ -334,13 +334,15 @@ pub struct ExpectedPlaylist {
 }
 
 impl Plan {
-    /// True when the plan changes nothing on the card.
+    /// True when the plan changes nothing on the card, nor the record of
+    /// it (a mapping whose file is gone is dropped by a sync).
     pub fn is_empty(&self) -> bool {
         self.copy.is_empty()
             && self.replace.is_empty()
             && self.moves.is_empty()
             && self.remove.is_empty()
             && self.playlists.is_empty()
+            && self.stale_mappings.is_empty()
     }
 
     /// Managed tracks the plan takes off the card, a replace to another
@@ -449,6 +451,27 @@ fn aside(path: &str, n: usize, ext: &str) -> String {
     }
 }
 
+/// Where each present track of `library` goes on the card, by track id,
+/// computed over the whole library so a change of scope moves nothing.
+/// Tracks under no library root have no place.
+pub fn targets(library: &[TrackRow], layout: Layout) -> HashMap<i64, String> {
+    let mut present: Vec<&TrackRow> = library
+        .iter()
+        .filter(|t| t.missing_since.is_none())
+        .collect();
+    present.sort_by_key(|t| t.id);
+    let placed: Vec<(i64, &Path, &Path)> = present
+        .iter()
+        .filter_map(|t| Some((t.id, root_of(layout.roots, &t.path)?, t.path.as_path())))
+        .collect();
+    let pairs: Vec<(&Path, &Path)> = placed.iter().map(|&(_, r, p)| (r, p)).collect();
+    placed
+        .iter()
+        .zip(naming::card_paths(layout.music_dir, &pairs))
+        .filter_map(|(&(id, _, _), p)| Some((id, p?)))
+        .collect()
+}
+
 pub fn plan(input: &PlanInput) -> Plan {
     let mut plan = Plan::default();
     let layout = input.layout;
@@ -459,19 +482,7 @@ pub fn plan(input: &PlanInput) -> Plan {
         .map(|t| (t.id, t))
         .collect();
     let in_scope = in_scope(input.library, input.playlists, input.scope);
-
-    // Where each present track goes, over the whole library so a scope
-    // change moves nothing.
-    let placed: Vec<(i64, &Path, &Path)> = present
-        .values()
-        .filter_map(|t| Some((t.id, root_of(layout.roots, &t.path)?, t.path.as_path())))
-        .collect();
-    let pairs: Vec<(&Path, &Path)> = placed.iter().map(|&(_, r, p)| (r, p)).collect();
-    let target: HashMap<i64, String> = placed
-        .iter()
-        .zip(naming::card_paths(layout.music_dir, &pairs))
-        .filter_map(|(&(id, _, _), p)| Some((id, p?)))
-        .collect();
+    let target = targets(input.library, layout);
 
     // The card, by FAT key.
     let audio: HashMap<String, &crate::card::CardFile> = input

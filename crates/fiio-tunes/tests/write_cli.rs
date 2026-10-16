@@ -290,26 +290,24 @@ fn asked_on_a_terminal(o: &Output, question: &str) -> bool {
 
 // ------------------------------------------------------------------ sync
 
-// Prevents: `sync` with neither --plan-only nor --playlists-only writing
-// (copying tracks does not exist yet): exit 1, the card, the index and the
-// backups untouched, even with --yes and --allow-mass-removal.
+// Prevents: a full sync leaving work for the next one: `sync --yes`
+// copies the tracks and writes the playlist, and a second sync finds the
+// card up to date.
 #[test]
-fn sync_without_a_mode_exits_1_and_writes_nothing() {
-    let mut sb = Sandbox::adopted(2);
+fn a_full_sync_then_another_finds_nothing_to_do() {
+    let sb = Sandbox::adopted(2);
     sb.playlist("Rock", &[1]);
-    for args in [
-        &["sync"][..],
-        &["sync", "--yes", "--allow-mass-removal"],
-        &["sync", "--verbose"],
-    ] {
-        let o = sb.run(args);
-        assert_code(&o, 1);
-        assert!(err(&o).contains("--playlists-only"), "{}", err(&o));
-    }
-    sb.card.assert_untouched();
-    assert!(sb.backups().is_empty());
-    assert_eq!(sb.card_id(), None);
-    assert_eq!(sb.count("device_playlists"), 0);
+    let o = sb.run(&["sync", "--yes"]);
+    assert_ok(&o);
+    assert!(
+        out(&o).contains("the card checked as planned"),
+        "{}",
+        out(&o)
+    );
+    assert_eq!(sb.count("device_playlists"), 1);
+    let o = sb.run(&["sync", "--yes"]);
+    assert_ok(&o);
+    assert!(out(&o).contains("up to date"), "{}", out(&o));
 }
 
 // Prevents: a script or a closed stdin writing to a card without having
@@ -709,4 +707,210 @@ fn a_restore_that_fails_part_way_says_syncs_are_refused_until_one_succeeds() {
     assert_ok(&sb.run(&["restore", &second, "--yes"]));
     assert_eq!(sb.restoring(), None);
     sb.sync();
+}
+
+// ---------------------------------------------------------------- F6: tracks
+
+/// `adopted(n)` and a first full sync: the card holds the tracks, the
+/// playlist file `Other.m3u8` stays unmanaged.
+fn synced(n: u32) -> Sandbox {
+    let sb = Sandbox::adopted(n);
+    assert_ok(&sb.run(&["sync", "--yes"]));
+    sb
+}
+
+// Prevents: a full sync from an empty adopted card that prints nothing of
+// what it did, or leaves work for the next one: every library file is on
+// the card byte for byte, mapped, in the backup's work.json, the backup is
+// named, and the second sync has nothing to do.
+#[test]
+fn a_full_sync_onto_an_empty_card_copies_the_library() {
+    let sb = Sandbox::new(3);
+    assert_ok(&sb.run(&["adopt"]));
+    assert_eq!(sb.count("device_tracks"), 0);
+    sb.playlist("Rock", &[1, 3]);
+    let o = sb.run(&["sync", "--yes"]);
+    assert_ok(&o);
+    for i in 1..=3 {
+        assert!(
+            sb.read(&format!("Music/t{i}.mp3"))
+                == fs::read(sb.music.join(format!("t{i}.mp3"))).unwrap(),
+            "t{i}"
+        );
+    }
+    assert_eq!(sb.count("device_tracks"), 3);
+    assert_eq!(
+        locations(&sb.read("Rock.m3u8")),
+        ["Music/t1.mp3", "Music/t3.mp3"]
+    );
+    let b = sb.backups();
+    assert_eq!(b.len(), 1);
+    assert_eq!(printed_stamp(&o), b[0]);
+    let work: serde_json::Value = serde_json::from_slice(
+        &fs::read(
+            backup::folder(&sb.data_dir().join("backups"), &sb.device_key())
+                .join(&b[0])
+                .join("work.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(work["copy"].as_array().unwrap().len(), 3);
+    let o = sb.run(&["sync", "--yes"]);
+    assert_ok(&o);
+    assert!(out(&o).contains("up to date"), "{}", out(&o));
+    assert_eq!(sb.backups().len(), 1, "an empty plan made a backup");
+}
+
+/// A card that fiio-tunes copied `n` tracks to (`Music/t<i>.mp3`), with
+/// the track `t2` mapped no more and its card file other bytes: what
+/// `doctor` calls an orphan (a file fiio-tunes wrote, named by a backup's
+/// work.json, that no mapping names).
+fn with_an_orphan() -> (Sandbox, Vec<u8>) {
+    let sb = Sandbox::new(2);
+    assert_ok(&sb.run(&["adopt"]));
+    sb.playlist("Rock", &[1]);
+    assert_ok(&sb.run(&["sync", "--yes"]));
+    let mut wrong = sb.read("Music/t2.mp3");
+    wrong.pop();
+    fs::write(sb.card.root.join("Music/t2.mp3"), &wrong).unwrap();
+    sb.db()
+        .execute(
+            "DELETE FROM device_tracks WHERE card_path = 'Music/t2.mp3'",
+            [],
+        )
+        .unwrap();
+    (sb, wrong)
+}
+
+// Prevents: `doctor` writing when not asked to, or complaining about a
+// card with nothing wrong: on a synced card it exits 0 and changes
+// nothing; with a part file and an orphan it lists them, names `--fix` and
+// still changes nothing.
+#[test]
+fn doctor_without_fix_reports_and_changes_nothing() {
+    let sb = synced(2);
+    let before = sb.card_tree();
+    let o = sb.run(&["doctor"]);
+    assert_ok(&o);
+    assert!(out(&o).contains("nothing to repair"), "{}", out(&o));
+    assert_eq!(sb.card_tree(), before);
+
+    let (sb, _) = with_an_orphan();
+    fs::write(sb.card.root.join("Music/.fiio-tunes-4.part"), b"half").unwrap();
+    // An audio file the owner put there is not an orphan.
+    fs::write(sb.card.root.join("Music/mine.mp3"), b"mine").unwrap();
+    let before = sb.card_tree();
+    let backups = sb.backups().len();
+    let o = sb.run(&["doctor"]);
+    assert_ok(&o);
+    let text = out(&o);
+    assert!(text.contains("Music/.fiio-tunes-4.part"), "{text}");
+    assert!(text.contains("Music/t2.mp3"), "{text}");
+    assert!(!text.contains("Music/mine.mp3"), "{text}");
+    assert!(text.contains("--fix"), "{text}");
+    assert_eq!(sb.card_tree(), before);
+    assert_eq!(sb.backups().len(), backups);
+}
+
+// Prevents: `doctor --fix` repairing without a confirmation: with no
+// terminal and no --yes it exits 1 asking for --yes, and the card and the
+// backups are as they were.
+#[test]
+fn doctor_fix_without_yes_and_no_terminal_changes_nothing() {
+    let sb = synced(2);
+    fs::write(sb.card.root.join("Music/.fiio-tunes-4.part"), b"half").unwrap();
+    let before = sb.card_tree();
+    let backups = sb.backups().len();
+    let o = sb.run(&["doctor", "--fix"]);
+    assert_code(&o, 1);
+    assert!(err(&o).contains("--yes"), "{}", err(&o));
+    assert_eq!(sb.card_tree(), before);
+    assert_eq!(sb.backups().len(), backups);
+}
+
+// Prevents: `doctor --fix --yes` leaving the card as it found it, deleting
+// the orphan instead of setting it aside, or touching the managed files:
+// the part file is gone, the orphan is under .fiio-tunes/orphans with its
+// bytes, a backup is printed and made, the tracks are as they were, and a
+// second doctor finds nothing.
+#[test]
+fn doctor_fix_yes_repairs_and_a_second_run_is_clean() {
+    let (sb, wrong) = with_an_orphan();
+    let t1 = sb.read("Music/t1.mp3");
+    fs::write(sb.card.root.join("Music/.fiio-tunes-4.part"), b"half").unwrap();
+    fs::write(sb.card.root.join("Music/mine.mp3"), b"mine").unwrap();
+    let backups = sb.backups().len();
+    let o = sb.run(&["doctor", "--fix", "--yes"]);
+    assert_ok(&o);
+    assert!(!sb.card.root.join("Music/.fiio-tunes-4.part").exists());
+    assert!(!sb.card.root.join("Music/t2.mp3").exists());
+    let moved: Vec<String> = sb
+        .card_tree()
+        .into_keys()
+        .filter(|k| k.starts_with(".fiio-tunes/orphans/") && k.ends_with("Music/t2.mp3"))
+        .collect();
+    assert_eq!(moved.len(), 1, "{:?}", sb.card_tree().keys());
+    assert_eq!(sb.read(&moved[0]), wrong);
+    assert_eq!(sb.read("Music/mine.mp3"), b"mine");
+    assert!(sb.read("Music/t1.mp3") == t1);
+    assert_eq!(sb.backups().len(), backups + 1);
+    assert_eq!(printed_stamp(&o), *sb.backups().last().unwrap());
+    assert_eq!(sb.count("device_tracks"), 1);
+
+    let o = sb.run(&["doctor"]);
+    assert_ok(&o);
+    assert!(out(&o).contains("nothing to repair"), "{}", out(&o));
+}
+
+// Prevents: a sync running over a card a stopped swap left under a hidden
+// name, and the way out being unclear: it exits 1 naming `doctor`, and
+// writes nothing. `doctor` lists the file.
+#[test]
+fn sync_refuses_a_card_with_a_hop_file_and_names_doctor() {
+    let sb = synced(2);
+    fs::write(sb.card.root.join("Music/.fiio-tunes-move-1.move"), b"x").unwrap();
+    let before = sb.card_tree();
+    let backups = sb.backups().len();
+    let o = sb.run(&["sync", "--yes"]);
+    assert_code(&o, 1);
+    assert!(err(&o).contains("doctor"), "{}", err(&o));
+    assert_eq!(sb.card_tree(), before);
+    assert_eq!(sb.backups().len(), backups);
+    let o = sb.run(&["doctor"]);
+    assert_ok(&o);
+    assert!(out(&o).contains(".fiio-tunes-move-1.move"), "{}", out(&o));
+}
+
+// Prevents: doctor running on a card that was never adopted: exit 1, an
+// error that names the problem, nothing written.
+#[test]
+fn doctor_on_a_card_that_is_not_adopted_exits_1() {
+    let sb = Sandbox::new(1);
+    let before = sb.card_tree();
+    let o = sb.run(&["doctor"]);
+    assert_code(&o, 1);
+    assert!(!err(&o).is_empty());
+    assert_eq!(sb.card_tree(), before);
+}
+
+// Prevents: `sync` saying "up to date" and recording nothing when the only
+// change is a mapping whose card file is gone (the track left the scope):
+// it backs up, drops the mapping, and the next sync has nothing to do.
+#[test]
+fn sync_drops_a_mapping_whose_file_is_gone_instead_of_saying_up_to_date() {
+    let sb = Sandbox::adopted(2);
+    sb.playlist("Rock", &[1]);
+    assert_ok(&sb.run(&["sync", "--yes"]));
+    assert_ok(&sb.run(&["scope", "only", "Rock"]));
+    fs::remove_file(sb.card.root.join("Music/t2.mp3")).unwrap();
+    let backups = sb.backups().len();
+    let o = sb.run(&["sync", "--yes"]);
+    assert_ok(&o);
+    assert!(!out(&o).contains("up to date"), "{}", out(&o));
+    assert_eq!(sb.count("device_tracks"), 1);
+    assert_eq!(sb.backups().len(), backups + 1);
+    let o = sb.run(&["sync", "--yes"]);
+    assert_ok(&o);
+    assert!(out(&o).contains("up to date"), "{}", out(&o));
 }

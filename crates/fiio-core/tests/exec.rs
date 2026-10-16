@@ -112,43 +112,15 @@ fn mappings(n: usize) -> Vec<PlaylistMapping> {
         .collect()
 }
 
-// Prevents: a plan that copies, replaces, moves or removes tracks being
-// applied by a version that cannot: it must say how many changes and
-// refuse, with the option or without. The same library, planned for
-// playlists only, is accepted.
+// Prevents: a plan with track changes being refused now that the
+// executor applies them.
 #[test]
-fn check_refuses_track_changes_and_counts_them() {
+fn check_accepts_track_changes() {
     let r = Rig::new(3);
     r.adopt_empty();
     let full = r.prepare(false).unwrap();
     assert_eq!(full.plan.copy.len(), 3);
-    for opts in [
-        Options::default(),
-        Options {
-            allow_mass_removal: true,
-        },
-    ] {
-        match exec::check(&full, opts) {
-            Err(Error::TracksLater(3)) => {}
-            other => panic!("{other:?}"),
-        }
-    }
-    assert!(exec::check(&r.prepare(true).unwrap(), Options::default()).is_ok());
-
-    // Every kind of track change counts, one each.
-    let (_r, mut p) = blank();
-    p.plan.copy = full.plan.copy.clone();
-    p.plan.copy.truncate(1);
-    p.plan.remove.push(RemoveOp {
-        path: "Music/x.mp3".into(),
-        track_id: None,
-        size: 1,
-        reason: RemoveReason::Unmanaged,
-    });
-    match exec::check(&p, Options::default()) {
-        Err(Error::TracksLater(2)) => {}
-        other => panic!("{other:?}"),
-    }
+    assert!(exec::check(&full, Options::default()).is_ok());
 }
 
 // Prevents: a plan that does not fit being applied, or the error giving
@@ -236,11 +208,11 @@ fn check_refuses_mass_removal_of_playlists_at_the_thresholds() {
     }
 }
 
-// Prevents: the track branch of the mass-removal guard being reachable
-// before track changes are refused: in this version any removal is a track
-// change, so the answer is TracksLater, option or not.
+// Prevents: the track branch of the mass-removal guard being skipped: six
+// managed tracks removed out of none left is refused without the option
+// and accepted with it.
 #[test]
-fn removing_many_tracks_is_refused_as_a_track_change_first() {
+fn removing_many_tracks_needs_the_option() {
     let (_r, mut p) = blank();
     p.plan.remove = (0..6)
         .map(|i| RemoveOp {
@@ -250,12 +222,14 @@ fn removing_many_tracks_is_refused_as_a_track_change_first() {
             reason: RemoveReason::OutOfScope,
         })
         .collect();
-    for allow in [false, true] {
-        let opts = Options {
-            allow_mass_removal: allow,
-        };
-        assert!(matches!(exec::check(&p, opts), Err(Error::TracksLater(6))));
-    }
+    assert!(matches!(
+        exec::check(&p, Options::default()),
+        Err(Error::MassRemoval(_))
+    ));
+    let opts = Options {
+        allow_mass_removal: true,
+    };
+    assert!(exec::check(&p, opts).is_ok());
 }
 
 // ------------------------------------------------------------ refusals
@@ -276,6 +250,8 @@ fn run_refuses_a_card_that_is_not_writable_before_anything_else() {
         &r.found(),
         &p,
         Options::default(),
+        &|_| {},
+        &std::sync::atomic::AtomicBool::new(false),
     ));
     assert!(matches!(f.error, Error::NotWritable(_)), "{}", f.error);
     assert!(f.backup.is_none());
@@ -292,9 +268,10 @@ fn run_applies_the_checks_and_writes_nothing_when_they_fail() {
     let r = Rig::new(3);
     r.adopt_empty();
     let before = r.snapshot();
-    let full = r.prepare(false).unwrap();
+    let mut full = r.prepare(false).unwrap();
+    full.plan.space.fits = false;
     let f = failed(r.run(&full, Options::default()));
-    assert!(matches!(f.error, Error::TracksLater(3)), "{}", f.error);
+    assert!(matches!(f.error, Error::NoSpace { .. }), "{}", f.error);
     assert!(f.backup.is_none());
     assert_eq!(r.snapshot(), before);
     assert!(r.backup_entries().is_empty());
@@ -451,7 +428,11 @@ fn the_first_sync_gives_the_card_its_id_and_writes_manifest_and_playlist() {
     let plan_json: serde_json::Value =
         serde_json::from_slice(&fs::read(b.dir.join("plan.json")).unwrap()).unwrap();
     assert!(plan_json["playlists"].is_array());
-    assert_eq!(fs::read(b.dir.join("work.json")).unwrap(), b"[]");
+    let work: serde_json::Value =
+        serde_json::from_slice(&fs::read(b.dir.join("work.json")).unwrap()).unwrap();
+    for k in ["remove", "moves", "copy", "replace"] {
+        assert_eq!(work[k], serde_json::json!([]), "{k}");
+    }
     let listing = fs::read_to_string(b.dir.join("listing.txt")).unwrap();
     assert!(listing.contains("Music/t1.mp3\t"), "{listing}");
     assert!(listing.contains("Other.m3u8\t"), "{listing}");

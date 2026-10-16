@@ -96,9 +96,9 @@ pub enum Error {
     #[error("the plan removes {0}; run again with --allow-mass-removal to apply it")]
     MassRemoval(String),
     #[error(
-        "the plan changes {0} tracks on the card, which this version does not do yet; run `fiio-tunes sync --playlists-only`"
+        "a sync stopped between the two renames of a swap and left {0} files under a hidden name; run `fiio-tunes doctor --fix` first"
     )]
-    TracksLater(usize),
+    StoppedMidMove(usize),
     #[error("{0}: would overwrite a file; nothing more written")]
     WouldOverwrite(String),
     #[error("the card changed since it was adopted ({0}); adopt it again")]

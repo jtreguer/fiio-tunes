@@ -680,6 +680,7 @@ fn prepared(w: &World, plan: Plan, lib: &[TrackRow], mapped_lists: &[i64]) -> Pr
             .map(|t| (t.id, t))
             .collect::<HashMap<_, _>>(),
         scope: (scope(Kind_::All, &[]), false),
+        taken_back: 0,
     }
 }
 

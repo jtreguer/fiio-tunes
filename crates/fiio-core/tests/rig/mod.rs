@@ -127,7 +127,59 @@ impl Rig {
             &self.found(),
             p,
             opts,
+            &|_| {},
+            &std::sync::atomic::AtomicBool::new(false),
         )
+    }
+
+    /// [`Rig::run`] with a progress callback and a cancel flag of the
+    /// test's own.
+    pub fn run_with(
+        &self,
+        p: &Prepared,
+        opts: Options,
+        progress: &dyn Fn(exec::Progress),
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> std::result::Result<Done, Failed> {
+        exec::run(
+            self.conn(),
+            &self.env.cfg,
+            &self.paths(),
+            &self.found(),
+            p,
+            opts,
+            progress,
+            cancel,
+        )
+    }
+
+    /// `prepare(false)` then `run`: tracks and playlists, both expected to
+    /// succeed.
+    pub fn full_sync(&self) -> Done {
+        let p = self.prepare(false).expect("prepare");
+        self.run(&p, Options::default())
+            .unwrap_or_else(|f| panic!("sync failed: {}", f.error))
+    }
+
+    /// The device's track mappings as library file name to card path.
+    pub fn mapped(&self) -> BTreeMap<String, String> {
+        let tracks = self.env.tracks();
+        devices::track_mappings(self.conn(), self.device().id)
+            .unwrap()
+            .into_iter()
+            .map(|m| {
+                let t = tracks.iter().find(|t| t.id == m.track_id).unwrap();
+                (
+                    t.path
+                        .strip_prefix(&self.env.music)
+                        .unwrap()
+                        .to_str()
+                        .unwrap()
+                        .to_owned(),
+                    m.card_path,
+                )
+            })
+            .collect()
     }
 
     /// `prepare(true)` then `run`, both expected to succeed.

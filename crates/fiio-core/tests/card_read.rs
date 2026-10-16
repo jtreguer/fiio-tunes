@@ -592,3 +592,77 @@ fn read_back_fetches_the_file_from_storage_not_from_the_page_cache() {
         "read_back fetched {fetched} of {size} bytes from storage (a plain read: {plain})"
     );
 }
+
+// Prevents: `leftover` taking a file that is not a sync's for one (the
+// doctor would delete it or refuse the card), or missing one that is: the
+// part name is `.fiio-tunes-<digits>.part`, a hop is
+// `.fiio-tunes-move-<digits>.move` or `.m3u8`, nothing looser, and
+// `part_name` makes names it recognises.
+#[test]
+fn leftover_names_are_recognised_exactly() {
+    use card::Leftover::{Hop, Part};
+    for (name, want) in [
+        (".fiio-tunes-1.part", Some(Part)),
+        (".fiio-tunes-123.part", Some(Part)),
+        (".fiio-tunes-move-0.move", Some(Hop)),
+        (".fiio-tunes-move-17.m3u8", Some(Hop)),
+        (".fiio-tunes-.part", None),
+        (".fiio-tunes-x.part", None),
+        (".fiio-tunes-1x.part", None),
+        (".fiio-tunes-1.part.bak", None),
+        (".fiio-tunes-1.PART", None),
+        (".fiio-tunes-move-.move", None),
+        (".fiio-tunes-move-1.mp3", None),
+        (".fiio-tunes-move-1", None),
+        (".fiio-tunes-move-a.move", None),
+        ("fiio-tunes-1.part", None),
+        (".fiio-tunes", None),
+        ("", None),
+    ] {
+        assert_eq!(card::leftover(name), want, "{name:?}");
+    }
+    assert_eq!(card::leftover(&card::part_name(42)), Some(Part));
+}
+
+// Prevents: the listing hiding a sync's leftovers (a `prepare` would plan
+// over a half-done swap) or inventing them: parts and hops are listed
+// sorted with their folder, a hidden folder of that name is not one, an
+// ordinary hidden file is not one, and none of them is audio or a playlist.
+#[test]
+fn parts_and_hops_are_listed_apart_from_audio_and_playlists() {
+    let t = tempfile::tempdir().unwrap();
+    let r = t.path();
+    put(r, "Music/b/.fiio-tunes-2.part", b"p");
+    put(r, "Music/.fiio-tunes-1.part", b"p");
+    put(r, "Music/.fiio-tunes-move-3.move", b"h");
+    for d in ["a", "b", "c", "d", "e", "f"] {
+        put(r, &format!("Music/{d}/.fiio-tunes-move-8.move"), b"h");
+    }
+    put(r, ".fiio-tunes-move-4.m3u8", b"h");
+    put(r, "Music/.hidden", b"other");
+    put(r, "Music/.fiio-tunes-9.part.txt", b"other");
+    put(r, "Music/a.mp3", b"a");
+    fs::create_dir_all(r.join("Music/.fiio-tunes-5.part")).unwrap();
+    put(
+        r,
+        "Music/.fiio-tunes-5.part/inner.mp3",
+        b"inside a folder of that name",
+    );
+    symlink("a.mp3", r.join("Music/.fiio-tunes-6.part")).unwrap();
+    let c = card::read(r).unwrap();
+    assert_eq!(
+        c.parts,
+        ["Music/.fiio-tunes-1.part", "Music/b/.fiio-tunes-2.part"]
+    );
+    let mut want: Vec<String> = [".fiio-tunes-move-4.m3u8", "Music/.fiio-tunes-move-3.move"]
+        .map(String::from)
+        .to_vec();
+    want.extend(
+        ["a", "b", "c", "d", "e", "f"].map(|d| format!("Music/{d}/.fiio-tunes-move-8.move")),
+    );
+    want.sort();
+    assert_eq!(c.hops, want);
+    assert_eq!(audio(&c), ["Music/a.mp3"]);
+    assert!(playlists(&c).is_empty());
+    assert!(c.problems.is_empty());
+}

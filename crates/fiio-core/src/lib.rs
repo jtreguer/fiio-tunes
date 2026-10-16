@@ -6,6 +6,7 @@ pub mod backup;
 pub mod card;
 pub mod config;
 pub mod device;
+pub mod doctor;
 mod error;
 pub mod exec;
 pub mod import;

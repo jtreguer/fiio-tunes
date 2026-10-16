@@ -14,11 +14,12 @@ its behaviour must stay identical to iprune's.
 
 ## Status
 
-F0 to F5 done (workspace, forked crates, `init`, `scan`, `playlist`, `import`,
+F0 to F6 done (workspace, forked crates, `init`, `scan`, `playlist`, `import`,
 detection, `device info`, card reading, naming, `probe`, `adopt`, the planner,
 `sync --plan-only`, `scope`, `sync --playlists-only`, backups, verification,
-`restore`; nothing yet run on the X3: probe, adopt and a first sync each need
-the owner's go). Milestones in
+`restore`, full `sync` with copies, moves, removals and checkpoints,
+take-back, `doctor`, signals; nothing yet run on the X3: probe, adopt and a
+first sync each need the owner's go). Milestones in
 `docs/technical.md` section 16:
 
 | # | Deliverable | Writes to the card |
@@ -62,8 +63,9 @@ libraries. Eject through `udisksctl`.
 crates/gpod-sys/     raw bindgen output, links libgpod-1.0 via pkg-config
 crates/gpod/         read-only safe wrapper; the only crate allowed to contain unsafe
 crates/fiio-core/    config, store, scan, tags, playlist (.m3u8 format), playlists
-                     (operations), mounts (mountinfo), lock, inhibit; the device,
-                     card, import, adoption, planner and executor modules follow
+                     (operations), mounts (mountinfo), lock, inhibit, device,
+                     card, naming, probe, import, adopt/adoption, plan, sync,
+                     exec, verify, backup, restore, doctor
 crates/fiio-tunes/   binary `fiio-tunes`: CLI
 ```
 
