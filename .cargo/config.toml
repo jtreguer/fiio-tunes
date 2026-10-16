@@ -1,0 +1,5 @@
+# Tests must never find the real X3 or iPod by looking at the mounts:
+# everything cargo runs (tests, the binaries they start, `cargo run`) has
+# device detection off. Set `device.mountpoint`, or use the installed binaries.
+[env]
+FIIO_TUNES_NO_DETECT = "1"

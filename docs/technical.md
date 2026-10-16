@@ -1,0 +1,368 @@
+# fiio-tunes: technical document
+
+Status: draft, 2026-10-16. Companion to [design.md](design.md). Where this
+document says "as in iprune", the rule is the one in
+`../iprune/docs/technical.md`, and the code is a copy of iprune's.
+
+## 1. Stack
+
+As iprune: Rust stable, edition 2024, Cargo workspace; `lofty`, `rusqlite`
+(bundled), `walkdir`, `rayon`, `blake3`, `clap`, `gtk4-rs` (plain GTK4),
+`serde`, `toml`, `directories`, `anyhow`, `thiserror`; `udisksctl` for eject.
+libgpod 0.8.3 through FFI, read only, for importing from an iPod.
+
+## 2. Repository layout
+
+```
+crates/gpod-sys/        bindgen output, links libgpod-1.0 (copied from iprune)
+crates/gpod/            read-only safe wrapper; the only crate with unsafe code
+crates/fiio-core/       config, store, scan, tags, playlist (.m3u8), playlists,
+                        mounts, lock, inhibit; later device, card, naming,
+                        adopt, import, plan, sync, exec, verify, backup, doctor,
+                        notify
+crates/fiio-tunes/      binary `fiio-tunes`: the CLI
+crates/fiio-tunes-gui/  binary `fiio-tunes-gui`: the GTK4 window (F7)
+packaging/              desktop entry and install.sh (F8)
+```
+
+`plan.rs` stays pure: no I/O. `naming.rs` (library path to card path) is pure
+too.
+
+## 3. libgpod
+
+`gpod-sys` is iprune's, unchanged. `gpod` keeps iprune's reading API only:
+`Database::open`, `open_file`, `tracks`, `playlists`, `track_by_dbid`,
+`master_playlist`, `mountpoint`, `device_info`, `firewire_guid`, and the
+`TrackRef` and `PlaylistRef` getters. There is no write, no playlist or track
+change, no `itdb_write`. The rules of iprune's wrapper hold: `Database` is
+neither `Send` nor `Sync`, strings are copied with lossy UTF-8, every `GError`
+is freed.
+
+## 4. Configuration
+
+`~/.config/fiio-tunes/config.toml`:
+
+```toml
+[library]
+roots = ["/mnt/seagate-1tb/Music"]
+exclude_extensions = ["m4v", "mp4", "mov"]
+
+[playlists]
+dir = "/mnt/seagate-1tb/Playlists-FiiO"
+path_style = "absolute"          # or "relative" to the playlists dir
+
+[sync]                           # for a device with no selection of its own
+scope = "all"                    # or "playlists", or "except"
+playlists = []
+remove_unmanaged = false
+keep_backups = 20
+
+[device]
+mountpoint = ""                  # empty means detect
+# allow_folder = true            # tests only: write to a plain folder
+
+[card]                           # added in F2 (not accepted before), set from the probe (section 9.4)
+music_dir = "Music"
+playlists_dir = ""               # "" is the card root
+```
+
+## 5. State and files
+
+| Path | Content |
+|---|---|
+| `~/.local/share/fiio-tunes/fiio-tunes.sqlite` | library index, mappings |
+| `~/.local/share/fiio-tunes/backups/<key>/<stamp>/` | the card's playlists, manifest, `mappings.json`, `plan.json`, `work.json`, `listing.txt` |
+| `~/.local/share/fiio-tunes/card.lock` | advisory lock, one fiio-tunes at a time with the card |
+| `~/.local/state/fiio-tunes/ui.toml` | the window's columns and background |
+| `<card>/.fiio-tunes/manifest.json` | device key, mappings, playlist names, stamp |
+| `<card>/Music/...` | the managed audio files |
+
+## 6. Database schema
+
+One migration, `store/migrations/0001_init.sql`: iprune's `tracks`,
+`playlists` (with tombstones) and `playlist_items` after all its migrations,
+then:
+
+- `devices (id, device_key UNIQUE, card_id, name, model, last_sync_at,
+  restoring, scope)`, the key being `usb:<serial>` (for a folder used as a
+  card in tests, the key in its manifest), `card_id` the id in the manifest of
+  the card adopted (9.1);
+- `device_scope_playlists (device_id, name)`, as in iprune;
+- `device_tracks (device_id, track_id, card_path, card_key, synced_hash,
+  synced_size)`, `card_path` relative to the card root with `/`, exactly as
+  on the card, and unique per device by `card_key`;
+- `device_playlists (device_id, playlist_id, card_name, card_key)`, unique
+  per device by `card_key`.
+
+`card_key` (`paths::card_key`) stands for the form FAT32 compares names in:
+NFC, then each character upper-cased when its upper case is one character,
+which is what FAT's upcase table does for ordinary letters. The kernel's own
+table may differ for rare characters (the dotless `ı`); the probe (9.4)
+checks a pair of accented names on the real card. SQLite's `NOCASE` folds ASCII only, so it is not used.
+
+No statistics tables.
+
+## 7. Library scan
+
+As in iprune, with two changes:
+
+- The formats read are those the X3 plays and lofty reads: MP3, AAC and ALAC
+  (m4a), WAV, AIFF, FLAC, Ogg Vorbis, APE. Opus, WMA, Musepack, WavPack, DSF
+  and DFF are reported as unsupported.
+- A folder under a root holding a player (`.fiio-tunes/manifest.json`, or an
+  iPod's `iPod_Control/iTunes/iTunesDB`) is skipped and reported.
+
+A file moved and retagged in one go gets a new row hash, so its card copy no
+longer matches and is copied again; nothing else marks it.
+
+## 8. Playlists
+
+As in iprune (section 8 there): UTF-8 `.m3u8`, unknown lines kept, atomic
+writes with an mtime check, no-clobber create and rename, the folder watched by
+the window.
+
+## 9. The card
+
+### 9.1 Detection and identity
+
+- Detect: vfat mounts in `/proc/self/mountinfo` whose block device has a USB
+  ancestor with `idVendor` `2972` (FiiO). `device.mountpoint` overrides.
+  `FIIO_TUNES_NO_DETECT` (set by `.cargo/config.toml` for everything cargo
+  runs) turns detection off.
+- Key: `usb:<serial>` from the same USB device. A folder (tests, with
+  `allow_folder`) uses the key in its manifest.
+- The card's identity is `card_id`, a random id kept in
+  `.fiio-tunes/manifest.json` on the card and in `devices.card_id`.
+  Adoption itself writes nothing; when the card already holds a manifest
+  with the same device key (the index was lost and rebuilt, or a first sync
+  crashed after writing it), adoption takes its `card_id` into `devices`.
+- The first sync after an adoption that found no manifest checks, before
+  writing anything, that the card still holds what adoption saw: every
+  adopted file present with its adopted size and the same BLAKE3 (read again,
+  adopted files only), and still no manifest. It then commits a new random
+  `card_id` to `devices`, and only after that writes the manifest.
+- Every other sync is refused when the card has no manifest, another key or
+  another `card_id`: "this card is not the one adopted; adopt it again". So a
+  second card in the same player, which has the same USB serial, is never
+  taken for the first; adopting it again is always the way out. A card cloned
+  file for file, manifest included, passes as the same card.
+- Writes need the root of a vfat mount of a `/dev` device, not read-only, as
+  in iprune (`check_writable`).
+
+### 9.2 Reading the card
+
+`card::read` walks the card into its audio files (relative path, size, mtime)
+and its `.m3u8` files, skipping `System Volume Information`, `.Trash-*`,
+`.fiio-tunes` and any other dot entry. Cover images, `Thumbs.db` and other
+non-audio files are neither listed nor touched.
+
+### 9.3 Naming
+
+`naming::card_path(root, path)`: the path relative to its library root, under
+`music_dir`. Each component has `" * : < > ? \ |` and control characters
+replaced with `_`, trailing dots and spaces removed, and is cut to 255 UTF-16
+units, keeping the extension; names are written in NFC. Two library files
+whose card paths have the same `card_key` (section 6: Unicode case and
+normalisation folded, as FAT compares them) get ` (2)`, ` (3)` before the
+extension, in library path order. Pure and deterministic.
+
+### 9.4 Playlist format: the probe
+
+FiiO documents only that the X3 2nd gen reads `.m3u8` files at the card root
+with relative paths and no drive letter, from Browse Files. The rest is
+settled on the device, once, before the first playlist is written:
+`fiio-tunes probe` (run only when the owner says so, with the X3 at hand)
+writes `zz-probe-NN.m3u8` files pointing at files already on the card, in
+these variants:
+
+| # | Variant |
+|---|---|
+| 1 | root, `Music/...` with `/`, UTF-8, LF, `#EXTM3U` and `#EXTINF` |
+| 2 | as 1, with `\` |
+| 3 | as 1, with a UTF-8 BOM |
+| 4 | as 1, CRLF |
+| 5 | as 1, no `#EXTM3U` and no `#EXTINF` |
+| 6 | as 1, a leading `/` |
+| 7 | as 1, `TF1:/Music/...` |
+| 8 | in `Playlists/`, `../Music/...` |
+| 9 | in `Playlists/`, `Music/...` (relative to the root) |
+| 10 | as 1, a path with accents and one with CJK characters; also two files whose names differ only by the case of an accented letter, to see whether the card keeps both |
+| 11 | as 1, a path over 200 characters |
+| 12 | as 1, 2,000 entries |
+
+The owner reports which play. `fiio-tunes probe --clean` removes them. The
+result fixes `[card] playlists_dir`, the separator, the BOM and the line
+endings, and is recorded here. Until then the defaults are variant 1.
+
+Results: not run yet.
+
+### 9.5 Card playlists
+
+A card playlist is rendered with `playlist::render` from entries whose
+locations are card paths relative to the playlist's folder, each with its
+`#EXTINF`. Its file name is the playlist's name with file-name characters
+replaced by `_` (iprune's third name pass), ` (2)` when its `card_key`
+collides with another's, and `.m3u8`.
+
+## 10. Adoption
+
+`adopt::run` (read only) over the card's audio files and the index:
+
+1. Same size and same BLAKE3 as exactly one library file: accepted. As
+   several (duplicates in the library): a duplicate proposal, the first as
+   default, the next free copy for the next card file.
+2. Otherwise iprune's passes on tags, read from the card file: normalised
+   title and artist, duration within 1 s (score 2 accepted only when the size
+   is equal too, else proposed); then title, artist and album within 2 s, any
+   size, proposed.
+3. One library file claimed by two card files: both are proposals.
+4. Everything else is unmanaged.
+
+Accepted matches go into `device_tracks` with the card file's own hash, so the
+first sync copies again those whose content differs and moves the others into
+`Music/`. Card `.m3u8` files are matched to library playlists by iprune's three
+name passes. `adopt-report.txt`, `--accept-proposals`, `--force`, and an empty
+card adopting with nothing to match, as in iprune. Adoption writes nothing to
+the card.
+
+## 11. Sync
+
+### 11.1 Planner
+
+`PlanInput`: library rows, library playlists, tombstones, card contents, track
+and playlist mappings, scope, `remove_unmanaged`, space, and the card's
+rendered playlist bytes. `Plan`:
+
+- `copy`: in scope with no mapping, or whose mapped file is gone (a stale
+  mapping);
+- `replace`: mapped, and the library hash differs from `synced_hash`;
+- `moves`: mapped, and `naming` gives another card path (also adopted files
+  outside `Music/`); a replace whose path changes is a remove plus a copy;
+- `remove`: mapped, and out of scope or missing from the library;
+- `playlists`: `Delete`, `Rename`, `Write` (whenever the rendered bytes differ
+  from the card file's), deletes first, then renames, then writes, by name;
+- `unmanaged`: audio and `.m3u8` files on the card not mapped, kept, or
+  removed with `remove_unmanaged`;
+- `skipped`, `entries_skipped`, `stale_mappings`, `space` (removals first; a
+  replace holds both files until its rename; 1% of capacity as margin),
+  `expected`.
+
+Scope rules, `prepare`'s refusals and the mass-removal guards (more than five
+and more than a tenth) are iprune's.
+
+### 11.2 Executor
+
+1. Refuse: not writable (9.1), wrong manifest, a restore unfinished, a plan
+   that does not fit, mass removals without `--allow-mass-removal`.
+2. Back up the card's playlist files, the manifest, `mappings.json`,
+   `plan.json`, `work.json` and `listing.txt` (path and size of every card
+   file) to `backups/<key>/<stamp>/`, filled under a hidden name and renamed
+   when complete. Keep `keep_backups`.
+3. Removals, then moves (`rename`, creating folders; folders under `Music/`
+   left empty are removed), then copies and replaces. A copy goes to
+   `<dir>/.fiio-tunes-<n>.part`, is `fsync`ed, checked for size, read back and
+   compared by BLAKE3 with the library file, then renamed over its target. A
+   library file gone or unreadable is skipped and reported; a card error
+   stops the sync.
+4. Checkpoints every 500 files or 10 minutes: mappings committed and the
+   manifest rewritten. An interrupted sync loses at most the file in flight,
+   whose `.part` file `doctor` removes.
+5. Playlists: deletes, renames, then writes with `write_atomic`.
+6. Verify (11.3).
+7. Record mappings, playlist mappings and `last_sync_at`, drop the tombstones
+   whose card file was deleted, write the manifest, prune backups, notify.
+
+Signals, Stop, the logind inhibitor, the lock, exit codes (0 success, 1 error,
+2 usage, 3 verification failed, 4 declined) and notifications follow iprune.
+
+### 11.3 Verification
+
+List the card again and compare with `expected`: every managed path present
+with its size, no managed path left that was removed, every managed playlist
+byte for byte, every unmanaged file as before. Any difference is printed (up to
+20 lines) and exits 3, naming the backup.
+
+### 11.4 Restore and doctor
+
+`restore <stamp>` puts back the backup's playlist files and manifest and
+replaces the mappings with the backup's; audio files removed since are
+copied again by the next sync. `doctor [--fix]` reports and repairs: `.part`
+files (deleted), card audio no mapping names (moved to
+`.fiio-tunes/orphans/<stamp>/`), mappings whose file is gone (dropped), library
+rows missing for 30 days and on no device (dropped).
+
+## 12. Import
+
+`import.rs`, CLI `fiio-tunes import`, and the window's Import… dialog.
+
+- **iprune folder.** Read `[playlists] dir` from
+  `~/.config/iprune/config.toml`. Each chosen file is read with
+  `playlist::read_all`, its resolved entries rewritten in fiio-tunes'
+  `path_style`, unresolved lines kept verbatim, and written as a new file.
+- **iPod or `iTunesDB` file.** Read with `gpod`. Offered: regular playlists
+  and smart playlists (their stored members), not the master nor Podcasts.
+  Each member is traced to a library path: first through a copy of
+  `~/.local/share/iprune/iprune.sqlite` (with its `-wal`) opened read-only in
+  a temp folder, `devices.firewire_guid` to `device_tracks.dbid` to
+  `tracks.path`, looked up in fiio-tunes' index by `path_key`; then by the
+  adoption matcher on size, duration and tags, with the content check when
+  the iPod is mounted. Members with no library file are left out and listed.
+- **Names.** A name already in fiio-tunes' folder is skipped, replaced (an
+  ordinary write, with the mtime check) or imported as `<name> (iPod)`.
+- **Scope.** Optionally, the iPod's iprune scope (`devices.scope` and
+  `device_scope_playlists`) becomes the X3's when every playlist it names was
+  imported.
+
+Import never writes to the iPod, the backup, iprune's index or iprune's
+playlists folder.
+
+## 13. CLI
+
+```
+fiio-tunes init --library DIR... --playlists DIR [--path-style S] [--force]
+fiio-tunes scan
+fiio-tunes playlist list|show|new|rm|rename|add|remove|move ...
+fiio-tunes import iprune [NAME...] | ipod [--file ITUNESDB] [NAME...] [--on-conflict skip|replace|rename] [--scope]
+fiio-tunes device info
+fiio-tunes probe [--clean]
+fiio-tunes adopt [--accept-proposals] [--force]
+fiio-tunes sync [--plan-only] [--verbose] [--json] [--yes] [--allow-mass-removal]
+fiio-tunes scope [all | only PLAYLIST... | except PLAYLIST... | default]
+fiio-tunes backups
+fiio-tunes restore <stamp> [--yes]
+fiio-tunes doctor [--fix] [--yes]
+fiio-tunes eject
+```
+
+## 14. Desktop UI
+
+iprune's section 14, with application id `dev.fiiotunes.FiioTunes`, state in
+`~/.local/state/fiio-tunes/ui.toml`, the statistics columns removed, the
+device panel and texts naming the X3, and the Import… dialog. The code of
+`style.rs`, the CSS files, `view_model.rs`, `selection_dialog.rs` and the
+widgets of `main.rs` is iprune's.
+
+## 15. Testing
+
+| Level | What | How |
+|---|---|---|
+| Unit | naming, planner, card playlist rendering, adoption scoring, import tracing | pure functions, table driven |
+| Integration | full sync on a fake card | a temp folder with `allow_folder`, ffmpeg fixtures |
+| Regression | sync twice | the second plan is empty and the card listing unchanged; also a proptest with random edits |
+| Import | fake iPods | `make_ipod.c` (libgpod) builds the `iTunesDB`; a fake `iprune.sqlite` maps it |
+| Real data, read only | import from the iPod backup | ignored test on `/mnt/seagate-1tb/iPod-backup-2026-10/iTunes/iTunesDB` |
+| Device | probe, adopt, playlists only, one small scope, the library | by hand, each with the owner's go |
+
+## 16. Milestones
+
+| # | Deliverable | Writes to the card |
+|---|---|---|
+| F0 | docs, workspace, forked crates, `init`, `scan`, `playlist` | no |
+| F1 | `import` from iprune's folder, an iPod and an `iTunesDB` file | no |
+| F2 | detection, `device info`, card reading, naming, the probe | probe files only |
+| F3 | `adopt`, taking the `card_id` of a manifest already there | no |
+| F4 | planner and `sync --plan-only` | no |
+| F5 | executor for playlists only, backups, verify, restore, the card identity checks of 9.1 | yes |
+| F6 | copy, replace, move, remove, checkpoints, `doctor`, signals | yes |
+| F7 | the window | yes |
+| F8 | desktop entry, notifications, `install.sh` | yes |

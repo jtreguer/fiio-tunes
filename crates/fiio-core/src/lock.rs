@@ -1,0 +1,147 @@
+//! One fiio-tunes at a time with the card. A sync, a repair, a restore and
+//! an eject each hold an advisory lock on `card.lock` in the data folder, so
+//! the CLI and the window, or two of either, never write or unmount the
+//! card under each other. A sync takes it before reading the card and keeps
+//! it until the write is verified, so it never acts on a card another
+//! changed meanwhile. The kernel drops the lock when the process ends, crash
+//! included.
+
+use std::fs::{File, OpenOptions};
+use std::path::PathBuf;
+
+use rustix::fs::{FlockOperation, flock};
+
+use crate::config::Paths;
+use crate::error::IoContext;
+use crate::{Error, Result};
+
+/// Held while it lives.
+#[derive(Debug)]
+pub struct CardLock {
+    _file: File,
+    path: PathBuf,
+}
+
+impl CardLock {
+    /// Refuses a lock taken for another data folder.
+    pub fn check(&self, paths: &Paths) -> Result<()> {
+        if self.path == lock_file(paths) {
+            Ok(())
+        } else {
+            Err(Error::NotWritable(format!(
+                "the card lock held is {}, not the one of {}",
+                self.path.display(),
+                paths.data_dir.display()
+            )))
+        }
+    }
+}
+
+fn lock_file(paths: &Paths) -> PathBuf {
+    paths.data_dir.join("card.lock")
+}
+
+/// How long [`card`] waits for a lock held only briefly: a program started
+/// by another thread of this process holds a copy of the lock's file until
+/// it runs, for a few milliseconds after the lock was released. Another
+/// fiio-tunes holds it for the length of a sync.
+const BRIEF: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Takes the lock, waiting at most [`BRIEF`]; refused with
+/// [`Error::CardBusy`] while another fiio-tunes holds it.
+pub fn card(paths: &Paths) -> Result<CardLock> {
+    std::fs::create_dir_all(&paths.data_dir).at(&paths.data_dir)?;
+    let path = lock_file(paths);
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .at(&path)?;
+    let start = std::time::Instant::now();
+    loop {
+        match flock(&file, FlockOperation::NonBlockingLockExclusive) {
+            Ok(()) => return Ok(CardLock { _file: file, path }),
+            Err(e) if e == rustix::io::Errno::WOULDBLOCK => {
+                if start.elapsed() >= BRIEF {
+                    return Err(Error::CardBusy);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(e) => {
+                return Err(Error::Io {
+                    path,
+                    source: e.into(),
+                });
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn paths(dir: &std::path::Path) -> Paths {
+        Paths {
+            config_file: dir.join("config.toml"),
+            data_dir: dir.join("data"),
+        }
+    }
+
+    #[test]
+    fn a_second_lock_is_refused_while_the_first_lives_and_allowed_after_it_drops() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = paths(dir.path());
+        let first = card(&p).unwrap();
+        // Another open file description, even in this process, is refused.
+        assert!(matches!(card(&p), Err(Error::CardBusy)));
+        assert!(matches!(card(&p), Err(Error::CardBusy)));
+        drop(first);
+        let again = card(&p).expect("free after the drop");
+        assert!(matches!(card(&p), Err(Error::CardBusy)));
+        drop(again);
+    }
+
+    #[test]
+    fn check_accepts_its_own_data_folder_and_refuses_another() {
+        let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (pa, pb) = (paths(a.path()), paths(b.path()));
+        let lock = card(&pa).unwrap();
+        lock.check(&pa).unwrap();
+        assert!(matches!(lock.check(&pb), Err(Error::NotWritable(_))));
+    }
+
+    #[test]
+    fn the_data_folder_is_created_when_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = Paths {
+            config_file: dir.path().join("config.toml"),
+            data_dir: dir.path().join("a/b/data"),
+        };
+        assert!(!p.data_dir.exists());
+        let _lock = card(&p).unwrap();
+        assert!(p.data_dir.join("card.lock").is_file());
+    }
+
+    #[test]
+    fn a_lock_file_left_behind_does_not_hold_the_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = paths(dir.path());
+        drop(card(&p).unwrap());
+        assert!(p.data_dir.join("card.lock").is_file());
+        card(&p).expect("the file alone is not a lock");
+    }
+
+    #[test]
+    fn a_data_folder_that_cannot_be_created_is_an_io_error_not_busy() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocker = dir.path().join("file");
+        std::fs::write(&blocker, b"x").unwrap();
+        let p = Paths {
+            config_file: dir.path().join("config.toml"),
+            data_dir: blocker.join("data"),
+        };
+        assert!(matches!(card(&p), Err(Error::Io { .. })));
+    }
+}

@@ -1,0 +1,13 @@
+[package]
+name = "fiio-tunes"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow = "1.0.104"
+clap = { version = "4.6.7", features = ["derive"] }
+fiio-core = { version = "0.1.0", path = "../fiio-core" }
+
+[dev-dependencies]
+tempfile = "3.27.0"
