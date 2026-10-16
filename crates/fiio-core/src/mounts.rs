@@ -40,7 +40,7 @@ pub fn unescape_mount(s: &str) -> String {
 }
 
 /// One mountinfo line: the mount and its source (`/dev/sdc2`).
-fn parse_line(line: &str) -> Option<(Mount, String)> {
+pub(crate) fn parse_line(line: &str) -> Option<(Mount, String)> {
     let (left, right) = line.split_once(" - ")?;
     let left: Vec<&str> = left.split(' ').collect();
     let root = unescape_mount(left.get(3)?);
@@ -49,11 +49,15 @@ fn parse_line(line: &str) -> Option<(Mount, String)> {
     let mut right = right.split(' ');
     let fstype = right.next()?.to_owned();
     let source = unescape_mount(right.next().unwrap_or(""));
+    // The superblock's options: a filesystem the kernel remounted read-only
+    // after an error (`errors=remount-ro`) says so only there.
+    let super_options = right.next().unwrap_or("");
+    let ro = |opts: &str| opts.split(',').any(|o| o == "ro");
     Some((
         Mount {
             mountpoint: PathBuf::from(mountpoint),
             fstype,
-            read_only: options.split(',').any(|o| o == "ro"),
+            read_only: ro(options) || ro(super_options),
             root: PathBuf::from(root),
         },
         source,

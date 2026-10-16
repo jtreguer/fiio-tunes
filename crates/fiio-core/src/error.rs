@@ -49,10 +49,27 @@ pub enum Error {
     NoIpod,
     #[error("several iPods are mounted ({0}); name one with --mountpoint")]
     SeveralIpods(String),
+    /// Detection is off; the text says how to name the device instead.
+    #[error("device detection is off (FIIO_TUNES_NO_DETECT is set); {0}")]
+    DetectionOff(&'static str),
     #[error(
-        "device detection is off (FIIO_TUNES_NO_DETECT is set); name the iPod with --mountpoint"
+        "no FiiO X3 found among the mounted FAT32 filesystems; connect it in USB storage mode, or set device.mountpoint"
     )]
-    DetectionOff,
+    NoCard,
+    #[error("several FiiO cards are mounted ({0}); set device.mountpoint to the one to use")]
+    SeveralCards(String),
+    #[error("{} already holds probe files; run `fiio-tunes probe --clean` first", .0.display())]
+    ProbeThere(PathBuf),
+    #[error(
+        "the probe written to {} has not been cleaned; run `fiio-tunes probe --clean` on that card first",
+        .0.display()
+    )]
+    ProbeElsewhere(PathBuf),
+    /// A file written to the card reads back wrong: exit code 3.
+    #[error("verification failed: {0}")]
+    VerifyFailed(String),
+    #[error("the library index has no MP3 file to copy for the probe")]
+    NoProbeSource,
     #[error("position {position} is out of range (playlist has {len} entries)")]
     BadPosition { position: usize, len: usize },
 }

@@ -10,6 +10,8 @@ use fiio_core::iprune::{IpruneConfig, IprunePaths};
 use fiio_core::store::Store;
 use fiio_core::{playlists, scan};
 
+/// Exit code when what was written to the card reads back wrong.
+const EXIT_VERIFY: u8 = 3;
 /// Exit code when the user answers no to a confirmation.
 const EXIT_DECLINED: u8 = 4;
 
@@ -50,6 +52,24 @@ enum Command {
     /// Copy playlists in from iprune's folder, an iPod or an iTunesDB file.
     #[command(subcommand)]
     Import(ImportCommand),
+    /// The X3 and its card.
+    #[command(subcommand)]
+    Device(DeviceCommand),
+    /// Write test playlists to the card, to see which forms the X3 plays.
+    Probe {
+        /// Remove the probe's files from the card instead.
+        #[arg(long)]
+        clean: bool,
+        /// Do not ask for confirmation.
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum DeviceCommand {
+    /// Show the X3 found, its card and what is on it. Writes nothing.
+    Info,
 }
 
 #[derive(Subcommand)]
@@ -689,6 +709,166 @@ fn import_ipod(a: IpodArgs) -> Result<()> {
     check_failed(&r.failed)
 }
 
+fn size_text(bytes: u64) -> String {
+    match bytes {
+        b if b < 1_000_000_000 => format!("{:.1} MB", b as f64 / 1e6),
+        b => format!("{:.1} GB", b as f64 / 1e9),
+    }
+}
+
+fn device_info() -> Result<()> {
+    let (config, _store) = load()?;
+    let found = fiio_core::device::locate(&config)?;
+    let mp = &found.mount.mountpoint;
+    let mut out = io::stdout().lock();
+    match &found.usb {
+        Some(u) => writeln!(
+            out,
+            "{} ({}, USB {}:{}, serial {})",
+            u.name.as_deref().unwrap_or("USB device"),
+            u.manufacturer.as_deref().unwrap_or("?"),
+            u.vendor,
+            u.product,
+            u.serial.as_deref().unwrap_or("none")
+        )?,
+        None => writeln!(out, "not a USB device")?,
+    }
+    writeln!(
+        out,
+        "key: {}",
+        found
+            .key()
+            .unwrap_or_else(|| "none (not an X3; a folder is named by its manifest)".into())
+    )?;
+    match &found.source {
+        Some(src) => writeln!(
+            out,
+            "mounted at {} from {src}, {}, {}",
+            mp.display(),
+            found.mount.fstype,
+            if found.mount.read_only {
+                "read-only"
+            } else {
+                "read-write"
+            }
+        )?,
+        None => writeln!(out, "folder {}, not a mount", mp.display())?,
+    }
+    let (size, free) = fiio_core::device::space(mp)?;
+    writeln!(
+        out,
+        "space: {} free of {}",
+        size_text(free),
+        size_text(size)
+    )?;
+    match fiio_core::device::check_writable(&found, config.device.allow_folder) {
+        Ok(()) => writeln!(out, "writes: allowed")?,
+        Err(e) => writeln!(out, "writes: refused ({e})")?,
+    }
+    let card = fiio_core::card::read(mp)?;
+    writeln!(
+        out,
+        "manifest: {}",
+        if card.manifest {
+            "present"
+        } else {
+            "none (the card has not been synced)"
+        }
+    )?;
+    // FAT compares names without case.
+    let music = fiio_core::paths::card_key(&format!("{}/", config.card.music_dir));
+    let under = card
+        .audio
+        .iter()
+        .filter(|f| fiio_core::paths::card_key(&f.path).starts_with(&music))
+        .count();
+    writeln!(
+        out,
+        "on the card: {} audio files ({}), {} in {}, {} playlists",
+        card.audio.len(),
+        size_text(card.audio_bytes()),
+        under,
+        config.card.music_dir,
+        card.playlists.len()
+    )?;
+    print_list(&mut out, "playlists", &card.playlists, |f| f.path.clone())?;
+    print_list(&mut out, "not read", &card.problems, |(p, why)| {
+        format!("{p}: {why}")
+    })?;
+    Ok(())
+}
+
+fn probe(clean: bool, yes: bool) -> Result<Outcome> {
+    use fiio_core::probe;
+    let (config, store) = load()?;
+    let paths = paths()?;
+    let found = fiio_core::device::locate(&config)?;
+    fiio_core::device::check_writable(&found, config.device.allow_folder)?;
+    let card = found.mount.mountpoint.clone();
+    let record = paths.data_dir.join("probe.toml");
+    let _lock = fiio_core::lock::card(&paths)?;
+    let mut out = io::stdout().lock();
+    if clean {
+        if !yes && !confirm(&format!("remove the probe files from {}?", card.display()))? {
+            return Ok(Outcome::Declined);
+        }
+        let c = probe::clean(&card, &record)?;
+        writeln!(
+            out,
+            "removed {} files and {} folders",
+            c.files,
+            c.dirs.len()
+        )?;
+        print_list(&mut out, "folders kept, not empty", &c.kept, |d| d.clone())?;
+        return Ok(Outcome::Done);
+    }
+    probe::check(&card, &record)?;
+    let src = probe::source(store.conn())?;
+    let secs = src
+        .info
+        .duration_ms
+        .map_or(-1, |d| i64::from(d.saturating_add(500) / 1000));
+    let plan = probe::plan(secs);
+    writeln!(
+        out,
+        "The probe writes to {}:\n  {} copies of {} ({}) in Music/zz-probe/\n  {} playlists:",
+        card.display(),
+        plan.audio.len(),
+        src.path.display(),
+        size_text(src.size * plan.audio.len() as u64),
+        plan.playlists.len()
+    )?;
+    for p in &plan.playlists {
+        writeln!(out, "    {}  {}", p.path, p.what)?;
+    }
+    out.flush()?;
+    if !yes && !confirm("write the probe to the card?")? {
+        return Ok(Outcome::Declined);
+    }
+    let w = probe::write(&card, &src.path, secs, &record)?;
+    writeln!(
+        out,
+        "wrote {} files ({}), each read back and checked",
+        w.files,
+        size_text(w.bytes)
+    )?;
+    writeln!(
+        out,
+        "the card holds \"04 é.mp3\" and \"04 É.mp3\" as {}",
+        if w.case_pair_kept {
+            "two files"
+        } else {
+            "one file"
+        }
+    )?;
+    writeln!(
+        out,
+        "On the X3: Browse Files, open each zz-probe playlist and note which play. \
+         Then `fiio-tunes probe --clean`."
+    )?;
+    Ok(Outcome::Done)
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let result = match &cli.command {
@@ -721,6 +901,8 @@ fn main() -> ExitCode {
             list: *list,
         })
         .map(|()| Outcome::Done),
+        Command::Device(DeviceCommand::Info) => device_info().map(|()| Outcome::Done),
+        Command::Probe { clean, yes } => probe(*clean, *yes),
     };
     match result {
         Ok(Outcome::Done) => ExitCode::SUCCESS,
@@ -733,7 +915,10 @@ fn main() -> ExitCode {
         }
         Err(e) => {
             let _ = writeln!(io::stderr(), "fiio-tunes: {e:#}");
-            ExitCode::FAILURE
+            match e.downcast_ref::<fiio_core::Error>() {
+                Some(fiio_core::Error::VerifyFailed(_)) => ExitCode::from(EXIT_VERIFY),
+                _ => ExitCode::FAILURE,
+            }
         }
     }
 }

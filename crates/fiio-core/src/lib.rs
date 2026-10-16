@@ -1,7 +1,9 @@
 //! Library, playlists, planner and executor. No UI.
 
 pub mod adopt;
+pub mod card;
 pub mod config;
+pub mod device;
 mod error;
 pub mod import;
 pub mod inhibit;
@@ -9,9 +11,11 @@ pub mod ipod;
 pub mod iprune;
 pub mod lock;
 pub mod mounts;
+pub mod naming;
 pub mod paths;
 pub mod playlist;
 pub mod playlists;
+pub mod probe;
 pub mod scan;
 pub mod store;
 pub mod tags;

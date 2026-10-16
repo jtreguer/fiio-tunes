@@ -178,16 +178,10 @@ pub fn itunesdb(mountpoint: &Path) -> PathBuf {
     mountpoint.join("iPod_Control/iTunes/iTunesDB")
 }
 
-/// Whether detection is turned off (`FIIO_TUNES_NO_DETECT`, set for
-/// everything cargo runs).
-pub fn detection_off() -> bool {
-    std::env::var_os("FIIO_TUNES_NO_DETECT").is_some_and(|v| !v.is_empty())
-}
-
 /// Mounted filesystems holding an iPod database.
 pub fn find_ipods() -> Result<Vec<Mount>> {
-    if detection_off() {
-        return Err(Error::DetectionOff);
+    if crate::device::detection_off() {
+        return Err(Error::DetectionOff("name the iPod with --mountpoint"));
     }
     let path = Path::new("/proc/self/mountinfo");
     let text = std::fs::read_to_string(path).at(path)?;

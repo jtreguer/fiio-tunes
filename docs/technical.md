@@ -147,21 +147,35 @@ the window.
   taken for the first; adopting it again is always the way out. A card cloned
   file for file, manifest included, passes as the same card.
 - Writes need the root of a vfat mount of a `/dev` device, not read-only, as
-  in iprune (`check_writable`).
+  in iprune (`check_writable`), and that device must be FiiO's (vendor
+  `2972`), also when `device.mountpoint` names it: a mistyped mountpoint
+  (`/boot` is vfat too) is refused. `allow_folder` lifts both checks, not
+  the read-only one. Read-only is read from the mount's options and from
+  the filesystem's, where a card the kernel remounted read-only after an
+  error says so. A card mounted at two places is one card.
+- Every file written to the card is synced, its pages dropped from the
+  page cache (`posix_fadvise(DONTNEED)`), then read back and compared by
+  BLAKE3 (`card::read_back`), so the bytes compared come from the card.
 
 ### 9.2 Reading the card
 
 `card::read` walks the card into its audio files (relative path, size, mtime)
 and its `.m3u8` files, skipping `System Volume Information`, `.Trash-*`,
 `.fiio-tunes` and any other dot entry. Cover images, `Thumbs.db` and other
-non-audio files are neither listed nor touched.
+non-audio files are neither listed nor touched. Audio means the extensions
+the scan indexes and those it reports as unsupported. Folders are opened
+with `O_NOATIME` and files only stat'ed, so reading the card does not
+rewrite its access dates.
 
 ### 9.3 Naming
 
 `naming::card_path(root, path)`: the path relative to its library root, under
 `music_dir`. Each component has `" * : < > ? \ |` and control characters
-replaced with `_`, trailing dots and spaces removed, and is cut to 255 UTF-16
-units, keeping the extension; names are written in NFC. Two library files
+replaced with `_`, trailing dots and spaces removed from the end of the name
+(a stem keeps them before its extension: `Track .mp3` stays), and is cut to
+255 UTF-16 units, keeping the extension; names are written in NFC. A folder
+spelled two ways that FAT takes for one gets the first spelling, in library
+path order, for every file under it. Two library files
 whose card paths have the same `card_key` (section 6: Unicode case and
 normalisation folded, as FAT compares them) get ` (2)`, ` (3)` before the
 extension, in library path order. Pure and deterministic.
@@ -172,8 +186,20 @@ FiiO documents only that the X3 2nd gen reads `.m3u8` files at the card root
 with relative paths and no drive letter, from Browse Files. The rest is
 settled on the device, once, before the first playlist is written:
 `fiio-tunes probe` (run only when the owner says so, with the X3 at hand)
-writes `zz-probe-NN.m3u8` files pointing at files already on the card, in
-these variants:
+writes `zz-probe-NN.m3u8` files in these variants. The files they point at
+are copies of one library MP3 (present, of one to ten minutes, the
+smallest), written to `Music/zz-probe/` under the names the variants need
+(`01 Probe.mp3`, accents, CJK, `04 é.mp3` and `04 É.mp3`, a path over 200
+characters), each read back and compared. The probe refuses to start when
+any of its files is already there, and remembers in
+`~/.local/share/fiio-tunes/probe.toml` the folders it created (`Music`,
+`Playlists`) so that `--clean` removes those only if they are empty, and
+`Music/zz-probe` always. One probe at a time: a probe of another card that
+still holds its files is refused; a record whose card no longer holds them
+(cleaned by hand, or the card mounted elsewhere now) is replaced, and with
+it the list of folders the probe made there: an empty `Music` or `Playlists`
+it left on that card stays. `--clean` also removes temp files a playlist write
+cut short left in the two folders it writes playlists to:
 
 | # | Variant |
 |---|---|
@@ -348,7 +374,7 @@ fiio-tunes playlist list|show|new|rm|rename|add|remove|move ...
 fiio-tunes import iprune [NAME...] [--on-conflict skip|replace|rename] [--list]
 fiio-tunes import ipod [--file ITUNESDB | --mountpoint DIR] [NAME...] [--on-conflict ...] [--scope | --list]
 fiio-tunes device info
-fiio-tunes probe [--clean]
+fiio-tunes probe [--clean] [--yes]
 fiio-tunes adopt [--accept-proposals] [--force]
 fiio-tunes sync [--plan-only] [--verbose] [--json] [--yes] [--allow-mass-removal]
 fiio-tunes scope [all | only PLAYLIST... | except PLAYLIST... | default]

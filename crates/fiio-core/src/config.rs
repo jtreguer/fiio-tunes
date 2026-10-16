@@ -35,6 +35,7 @@ pub struct Config {
     pub playlists: Playlists,
     pub sync: Sync,
     pub device: Device,
+    pub card: Card,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -90,6 +91,33 @@ pub struct Device {
     /// mounted FAT32 device.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub allow_folder: bool,
+}
+
+/// Where things go on the card, relative to its root, with `/`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Card {
+    /// The folder the library is copied into.
+    pub music_dir: String,
+    /// The folder the playlists are written to; empty for the card root.
+    pub playlists_dir: String,
+}
+
+impl Default for Card {
+    fn default() -> Self {
+        Card {
+            music_dir: "Music".into(),
+            playlists_dir: String::new(),
+        }
+    }
+}
+
+/// Whether `dir` is a plain relative folder on the card: `/` between
+/// names, each a name FAT holds as it is (see `naming::clean`), not padded,
+/// at most 255 UTF-16 units.
+fn plain_card_dir(dir: &str) -> bool {
+    dir.split('/')
+        .all(|c| crate::naming::clean(c) == c && c.trim() == c && c.encode_utf16().count() <= 255)
 }
 
 impl Default for Library {
@@ -172,6 +200,15 @@ impl Config {
         }
         if self.library.roots.iter().any(|r| r.parent().is_none()) {
             return fail("library.roots must not be / (it holds the card and everything else)");
+        }
+        if !plain_card_dir(&self.card.music_dir) {
+            return fail("card.music_dir must be a folder on the card such as \"Music\"");
+        }
+        let pl = &self.card.playlists_dir;
+        if !pl.is_empty() && !plain_card_dir(pl) {
+            return fail(
+                "card.playlists_dir must be empty (the card root) or a folder on the card",
+            );
         }
         let mp = &self.device.mountpoint;
         if !mp.as_os_str().is_empty() && !mp.is_absolute() {
