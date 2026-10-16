@@ -550,9 +550,10 @@ Decisions taken in F6:
   them are refused as ambiguous.
 - **Scope.** Optionally, the iPod's iprune scope (`devices.scope` and
   `device_scope_playlists`, or iprune's `[sync]` when the scope is NULL)
-  becomes the X3's when every playlist it names was imported. Until F3 there
-  is no X3 row in `devices`, so it is written to `[sync]` in the config, the
-  scope of a device with no selection of its own. iprune's names are traced
+  becomes the X3's when every playlist it names was imported. It is set as
+  the own scope of the adopted X3 when exactly one is adopted (F7), and
+  otherwise written to `[sync]` in the config, the scope of a device with no
+  selection of its own. iprune's names are traced
   to the iPod's playlists through `device_playlists.ipod_id`, then by the
   name passes.
 
@@ -601,6 +602,43 @@ iprune's section 14, with application id `dev.fiiotunes.FiioTunes`, state in
 device panel and texts naming the X3, and the Import… dialog. The code of
 `style.rs`, the CSS files, `view_model.rs`, `selection_dialog.rs` and the
 widgets of `main.rs` is iprune's.
+
+Decisions taken in F7:
+
+- Crate `fiio-tunes-gui`, binary `fiio-tunes-gui`. The grid has iprune's
+  columns less Plays, Skips, Rating and Last Played; Kind also names FLAC,
+  Ogg Vorbis and APE.
+- The device panel shows the X3 connected (`device::locate`), adopted or
+  not, else the first adopted one, not connected. A configured
+  `device.mountpoint` counts as connected only when it is a FiiO card
+  there now (or a folder, with `allow_folder`). Buttons: Adopt… for one not
+  adopted, Selection… for an adopted one, Eject when connected. The panel
+  follows `gio::VolumeMonitor`.
+- Sync: a worker (`sync_job`, no GTK) scans the library and, holding the
+  card lock, runs `sync::prepare`; the dialog shows the plan as `sync`
+  prints it, the scope, every change in an expander, and the mass-removal
+  warning with "Apply it anyway". Apply takes the lock, prepares again and
+  refuses if the plan, free space aside, is not the one shown; otherwise
+  `exec::run` applies it, with a progress bar and Stop (shown when there
+  are copies, off once they are over). While it writes, neither the dialog
+  nor the window closes, the application is held, sleep is inhibited, and a
+  signal acts as Stop. The result names the backup and the restore command.
+- Adopt…: a worker (`adopt_job`) scans, reads the card under the lock and
+  runs `adoption::run`, refusing an X3 already adopted; one row per
+  proposal with a drop-down of "leave it unmanaged" and the candidates.
+  Save checks the card connected has the same device key, then
+  `adoption::choose` (one decision per proposal, through
+  `adopt::resolve_choices`, refusing a library file chosen twice) and
+  `adoption::save`.
+- Import…, next to the New Playlist button: the source (iprune's folder,
+  the iPod connected or an `iTunesDB` file), then its playlists, all
+  checked, with a filter, what to do with a name taken, and for an iPod
+  whether its iprune scope becomes the X3's. One worker reads the source
+  (libgpod stays on it; what it read is plain data), another imports.
+- Eject: `device::eject` unmounts and powers off through `udisksctl`, and
+  refuses anything but the block device of a FiiO player. The CLI gains
+  `fiio-tunes eject` (section 13), which it lacked.
+- Notifications come with F8.
 
 ## 15. Testing
 

@@ -14,11 +14,12 @@ its behaviour must stay identical to iprune's.
 
 ## Status
 
-F0 to F6 done (workspace, forked crates, `init`, `scan`, `playlist`, `import`,
+F0 to F7 done (workspace, forked crates, `init`, `scan`, `playlist`, `import`,
 detection, `device info`, card reading, naming, `probe`, `adopt`, the planner,
 `sync --plan-only`, `scope`, `sync --playlists-only`, backups, verification,
 `restore`, full `sync` with copies, moves, removals and checkpoints,
-take-back, `doctor`, signals; nothing yet run on the X3: probe, adopt and a
+take-back, `doctor`, signals, `eject`, the window with its Sync, Adopt,
+Selection, Import and Eject; nothing yet run on the X3: probe, adopt and a
 first sync each need the owner's go). Milestones in
 `docs/technical.md` section 16:
 
@@ -67,6 +68,7 @@ crates/fiio-core/    config, store, scan, tags, playlist (.m3u8 format), playlis
                      card, naming, probe, import, adopt/adoption, plan, sync,
                      exec, verify, backup, restore, doctor
 crates/fiio-tunes/   binary `fiio-tunes`: CLI
+crates/fiio-tunes-gui/ binary `fiio-tunes-gui`: the GTK4 window (iprune's, adapted)
 ```
 
 ## Commands

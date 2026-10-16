@@ -633,3 +633,108 @@ fn import_ipod_scope_with_a_scoped_playlist_that_failed_names_it_and_changes_no_
         config_before
     );
 }
+
+// ---- the scope, with the X3 adopted (F7)
+
+impl Sandbox {
+    /// A card folder `name` holding a copy of a.mp3, set as the card
+    /// (`allow_folder`) and adopted.
+    fn adopt_card(&self, name: &str) {
+        let card = self.base().join(name);
+        fs::create_dir(&card).unwrap();
+        fs::copy(fixture(Kind::Mp3, 1), card.join("a.mp3")).unwrap();
+        let file = self.base().join("config/fiio-tunes/config.toml");
+        let mut c = Config::load(&file).unwrap();
+        c.device.mountpoint = card;
+        c.device.allow_folder = true;
+        c.save(&file).unwrap();
+        assert_ok(&self.run(&["adopt"]));
+    }
+
+    /// `(device key, scope, scope playlists)` of every device in the index.
+    fn device_scopes(&self) -> Vec<(String, Option<String>, Vec<String>)> {
+        let db = rusqlite::Connection::open(self.base().join("data/fiio-tunes/fiio-tunes.sqlite"))
+            .unwrap();
+        let mut stmt = db
+            .prepare("SELECT id, device_key, scope FROM devices ORDER BY id")
+            .unwrap();
+        let rows: Vec<(i64, String, Option<String>)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        rows.into_iter()
+            .map(|(id, key, scope)| {
+                let mut stmt = db
+                    .prepare(
+                        "SELECT name FROM device_scope_playlists WHERE device_id = ?1 ORDER BY name",
+                    )
+                    .unwrap();
+                let names = stmt
+                    .query_map([id], |r| r.get(0))
+                    .unwrap()
+                    .map(Result::unwrap)
+                    .collect();
+                (key, scope, names)
+            })
+            .collect()
+    }
+}
+
+// Prevents: `--scope` writing `[sync]` while an adopted X3 has (or can have)
+// its own scope, which wins over `[sync]`: the copy would change nothing the
+// user sees. With exactly one X3 adopted it is that X3's own scope, and the
+// config's `[sync]` stays as it was.
+#[test]
+fn import_ipod_scope_goes_to_the_only_adopted_x3_and_not_to_the_config() {
+    let (sb, t) = Sandbox::library();
+    sb.adopt_card("card");
+    let fake = ipod_spec(&t).mounted();
+    iprune_scope(&sb, "playlists", &["Rock", "jazz"]);
+    let ip = sb.iprune_trees();
+    let before = sb.device_scopes();
+    assert_eq!(before.len(), 1);
+    assert_eq!(before[0].1, None, "the X3 follows [sync] before the import");
+
+    let o = sb.run(&["import", "ipod", "--mountpoint", s(&fake.root()), "--scope"]);
+    assert_ok(&o);
+    let key = before[0].0.clone();
+    assert!(out(&o).contains(&key), "stdout names the X3: {}", out(&o));
+    assert_eq!(
+        sb.device_scopes(),
+        [(
+            key,
+            Some("playlists".to_owned()),
+            vec!["Jazz".to_owned(), "Rock".to_owned()]
+        )]
+    );
+    let cfg = sb.config();
+    assert_eq!(cfg.sync.scope, Scope::All, "[sync] is untouched");
+    assert!(cfg.sync.playlists.is_empty());
+    assert_eq!(sb.iprune_trees(), ip);
+}
+
+// Prevents: the scope landing on one X3 of two, chosen by luck: with two
+// adopted it goes to `[sync]`, and neither X3 gets a scope of its own.
+#[test]
+fn import_ipod_scope_with_two_adopted_x3s_goes_to_the_config() {
+    let (sb, t) = Sandbox::library();
+    sb.adopt_card("card1");
+    sb.adopt_card("card2");
+    assert_eq!(sb.device_scopes().len(), 2);
+    let fake = ipod_spec(&t).mounted();
+    iprune_scope(&sb, "playlists", &["Rock"]);
+
+    let o = sb.run(&["import", "ipod", "--mountpoint", s(&fake.root()), "--scope"]);
+    assert_ok(&o);
+    let cfg = sb.config();
+    assert_eq!(cfg.sync.scope, Scope::Playlists);
+    assert_eq!(cfg.sync.playlists, ["Rock"]);
+    assert!(
+        sb.device_scopes()
+            .iter()
+            .all(|(_, scope, _)| scope.is_none()),
+        "{:?}",
+        sb.device_scopes()
+    );
+}

@@ -75,6 +75,8 @@ pub enum Error {
     ForeignManifest { found: String, key: String },
     #[error("{0} was adopted already; run again with --force to replace its mappings")]
     AlreadyAdopted(String),
+    #[error("a library file is chosen twice: {}", .0.join("; "))]
+    ChoiceConflicts(Vec<String>),
     #[error("{0} has not been adopted; run `fiio-tunes adopt` first")]
     NotAdopted(String),
     #[error(
@@ -110,6 +112,8 @@ pub enum Error {
     /// A file written to the card reads back wrong: exit code 3.
     #[error("verification failed: {0}")]
     VerifyFailed(String),
+    #[error("eject: {0}")]
+    Eject(String),
     #[error("the library index has no MP3 file to copy for the probe")]
     NoProbeSource,
     #[error("position {position} is out of range (playlist has {len} entries)")]

@@ -107,7 +107,13 @@ fn build(kind: Kind, variant: u32, secs: u32, prefix: &str, extra: &[(&str, &str
         return path;
     }
     fs::create_dir_all(&dir).unwrap();
-    let tmp = dir.join(format!(".{}-{name}", std::process::id()));
+    // Unique per thread as well as per process: a test binary that includes
+    // this file more than once (the GUI crate's) has one lock per copy.
+    let tmp = dir.join(format!(
+        ".{}-{:?}-{name}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
     let out = Command::new("ffmpeg")
         .args(["-loglevel", "error", "-y", "-f", "lavfi", "-i"])
         .arg(format!(

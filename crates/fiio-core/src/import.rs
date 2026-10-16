@@ -727,6 +727,39 @@ pub fn iprune_scope(
     Ok(ScopeCopy::Ready { scope, playlists })
 }
 
+/// Where a copied scope was set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScopeTarget {
+    /// The scope of the X3 with this key, the only one adopted.
+    Device(String),
+    /// `[sync]` in the config, the scope of a player with none of its own.
+    Config,
+}
+
+/// Sets `scope` and `playlists` as what the X3 syncs: the own scope of the
+/// adopted X3 when there is exactly one, else `[sync]` in `cfg`, saved to
+/// `config_file`.
+pub fn set_scope(
+    conn: &Connection,
+    cfg: &mut Config,
+    config_file: &Path,
+    scope: Scope,
+    playlists: Vec<String>,
+) -> Result<ScopeTarget> {
+    if let [device] = &crate::store::devices::devices(conn)?[..] {
+        let s = crate::store::devices::DeviceScope {
+            kind: scope,
+            playlists,
+        };
+        crate::store::devices::set_scope(conn, device.id, Some(&s))?;
+        return Ok(ScopeTarget::Device(device.device_key.clone()));
+    }
+    cfg.sync.scope = scope;
+    cfg.sync.playlists = playlists;
+    cfg.save(config_file)?;
+    Ok(ScopeTarget::Config)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

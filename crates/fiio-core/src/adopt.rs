@@ -445,6 +445,54 @@ pub fn resolve(a: &Adoption, accept_proposals: bool) -> (Vec<(u64, i64)>, Vec<&P
     (mapping, left)
 }
 
+/// A library track two device tracks would share.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Conflict {
+    pub track_id: i64,
+    /// The device tracks that would share it, in key order.
+    pub keys: Vec<u64>,
+}
+
+/// A mapping and the proposals it leaves unresolved.
+pub type Resolved<'a> = (Vec<(u64, i64)>, Vec<&'a Proposal>);
+
+/// The final `(key, library id)` mapping from a decision per proposal:
+/// `Some(id)` maps the device track to that candidate; `None`, no entry or
+/// an id that is not one of its candidates leaves it unmanaged. The mapping
+/// is one to one, so a library track chosen twice, or chosen when an
+/// accepted match has it, is refused with every such conflict. Returns the
+/// mapping and the proposals left, as [`resolve`] does.
+pub fn resolve_choices<'a>(
+    a: &'a Adoption,
+    choices: &HashMap<u64, Option<i64>>,
+) -> std::result::Result<Resolved<'a>, Vec<Conflict>> {
+    let mut mapping = a.accepted.clone();
+    let mut left = Vec::new();
+    for p in &a.proposals {
+        match choices.get(&p.key).copied().flatten() {
+            Some(id) if p.candidates.contains(&id) => mapping.push((p.key, id)),
+            _ => left.push(p),
+        }
+    }
+    let mut users: std::collections::BTreeMap<i64, Vec<u64>> = Default::default();
+    for &(key, id) in &mapping {
+        users.entry(id).or_default().push(key);
+    }
+    let conflicts: Vec<Conflict> = users
+        .into_iter()
+        .filter(|(_, k)| k.len() > 1)
+        .map(|(track_id, mut keys)| {
+            keys.sort_unstable();
+            Conflict { track_id, keys }
+        })
+        .collect();
+    if !conflicts.is_empty() {
+        return Err(conflicts);
+    }
+    mapping.sort_unstable();
+    Ok((mapping, left))
+}
+
 fn loose(name: &str) -> String {
     name.nfc().collect::<String>().to_lowercase()
 }

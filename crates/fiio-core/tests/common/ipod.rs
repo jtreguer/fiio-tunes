@@ -30,14 +30,22 @@ static BUILD: Mutex<()> = Mutex::new(());
 fn make_ipod() -> PathBuf {
     let mut h = DefaultHasher::new();
     MAKE_IPOD_C.hash(&mut h);
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("ipod-tools");
+    // Cargo sets CARGO_TARGET_TMPDIR for integration tests only; a unit-test
+    // binary that includes this file (the GUI crate's) uses the workspace's
+    // `target/tmp`.
+    let target = Path::new(
+        option_env!("CARGO_TARGET_TMPDIR")
+            .unwrap_or(concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/tmp")),
+    );
+    let dir = target.join("ipod-tools");
     let exe = dir.join(format!("make_ipod-{:016x}", h.finish()));
     let _guard = BUILD.lock().unwrap_or_else(|e| e.into_inner());
     if exe.exists() {
         return exe;
     }
     fs::create_dir_all(&dir).unwrap();
-    let src = dir.join(format!(".make_ipod-{}.c", std::process::id()));
+    let tid = format!("{}-{:?}", std::process::id(), std::thread::current().id());
+    let src = dir.join(format!(".make_ipod-{tid}.c"));
     fs::write(&src, MAKE_IPOD_C).unwrap();
     let flags = Command::new("pkg-config")
         .args(["--cflags", "--libs", "libgpod-1.0", "glib-2.0"])
@@ -45,7 +53,7 @@ fn make_ipod() -> PathBuf {
         .expect("pkg-config must be installed");
     assert!(flags.status.success(), "pkg-config cannot find libgpod");
     let flags = String::from_utf8(flags.stdout).unwrap();
-    let tmp = dir.join(format!(".make_ipod-{}", std::process::id()));
+    let tmp = dir.join(format!(".make_ipod-{tid}"));
     let status = Command::new("cc")
         .arg("-o")
         .arg(&tmp)

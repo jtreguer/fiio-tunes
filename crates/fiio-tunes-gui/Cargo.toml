@@ -1,0 +1,19 @@
+[package]
+name = "fiio-tunes-gui"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow = "1.0.104"
+async-channel = "2.5.0"
+ctrlc = { version = "3.5.2", features = ["termination"] }
+directories = "6.0.0"
+fiio-core = { version = "0.1.0", path = "../fiio-core" }
+gtk = { version = "0.11.5", package = "gtk4", features = ["v4_12"] }
+serde = { version = "1.0.229", features = ["derive"] }
+toml = "1.1.8"
+
+[dev-dependencies]
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+tempfile = "3.27.0"

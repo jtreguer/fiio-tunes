@@ -125,6 +125,8 @@ enum Command {
         #[arg(long)]
         yes: bool,
     },
+    /// Unmount the X3's card and power the player off.
+    Eject,
     /// Write test playlists to the card, to see which forms the X3 plays.
     Probe {
         /// Remove the probe's files from the card instead.
@@ -770,19 +772,21 @@ fn import_ipod(a: IpodArgs) -> Result<()> {
         match import::iprune_scope(&ic, &ipod, &r)? {
             import::ScopeCopy::Ready { scope, playlists } => {
                 let paths = paths()?;
-                config.sync.scope = scope;
-                config.sync.playlists = playlists;
-                config.save(&paths.config_file)?;
                 let what = match scope {
                     fiio_core::config::Scope::All => "the whole library".to_owned(),
-                    fiio_core::config::Scope::Playlists => {
-                        format!("only {}", config.sync.playlists.join(", "))
-                    }
+                    fiio_core::config::Scope::Playlists => format!("only {}", playlists.join(", ")),
                     fiio_core::config::Scope::Except => {
-                        format!("all except {}", config.sync.playlists.join(", "))
+                        format!("all except {}", playlists.join(", "))
                     }
                 };
-                writeln!(out, "default sync scope set to iprune's: {what}")?;
+                match import::set_scope(conn, &mut config, &paths.config_file, scope, playlists)? {
+                    import::ScopeTarget::Device(key) => {
+                        writeln!(out, "sync scope of {key} set to iprune's: {what}")?
+                    }
+                    import::ScopeTarget::Config => {
+                        writeln!(out, "default sync scope set to iprune's: {what}")?
+                    }
+                }
             }
             import::ScopeCopy::Missing(missing) => {
                 // A playlist that failed to write is the first thing to fix.
@@ -1208,6 +1212,21 @@ fn run_sync(args: SyncArgs) -> Result<Outcome> {
     }
 }
 
+fn run_eject() -> Result<()> {
+    let (config, _store) = load()?;
+    let found = fiio_core::device::locate(&config)?;
+    // Not while another fiio-tunes writes the card.
+    let _lock = fiio_core::lock::card(&paths()?)?;
+    match fiio_core::device::eject(&found)? {
+        Some(warning) => println!("{warning}"),
+        None => println!(
+            "ejected {}: the X3 can be unplugged",
+            found.mount.mountpoint.display()
+        ),
+    }
+    Ok(())
+}
+
 fn run_doctor(fix: bool, yes: bool) -> Result<Outcome> {
     use fiio_core::doctor;
     let (config, mut store) = load()?;
@@ -1579,6 +1598,7 @@ fn main() -> ExitCode {
         Command::Backups { device } => run_backups(device.as_deref()).map(|()| Outcome::Done),
         Command::Restore { stamp, yes } => run_restore(stamp, *yes),
         Command::Doctor { fix, yes } => run_doctor(*fix, *yes),
+        Command::Eject => run_eject().map(|()| Outcome::Done),
         Command::Scope { set, device } => {
             run_scope(set.as_ref(), device.as_deref()).map(|()| Outcome::Done)
         }

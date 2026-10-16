@@ -247,9 +247,177 @@ pub fn space(path: &Path) -> Result<(u64, u64)> {
     Ok((s.f_blocks * s.f_frsize, s.f_bavail * s.f_frsize))
 }
 
+/// Unmounts the X3's card `found` and powers the player off, through
+/// `udisksctl`, as the file manager would. Refuses anything but the block
+/// device of a FiiO player (a folder used as a card, a mistyped
+/// mountpoint). Returns a warning when it was unmounted but could not be
+/// powered off: it can be unplugged then too, since unmounting writes
+/// everything out.
+pub fn eject(found: &Found) -> Result<Option<String>> {
+    let fiio = found.usb.as_ref().is_some_and(|u| u.is_fiio());
+    match &found.source {
+        Some(dev) if fiio && dev.starts_with("/dev/") => eject_device(dev, &mut udisksctl),
+        _ => Err(Error::Eject(format!(
+            "{} is not the card of a connected X3",
+            found.mount.mountpoint.display()
+        ))),
+    }
+}
+
+/// The two steps of [`eject`] on `dev`, with `run` standing for `udisksctl`
+/// (a seam for tests).
+fn eject_device(
+    dev: &str,
+    run: &mut dyn FnMut(&[&str]) -> std::result::Result<(), String>,
+) -> Result<Option<String>> {
+    run(&["unmount", "--block-device", dev])
+        .map_err(|e| Error::Eject(format!("could not unmount {dev}: {e}")))?;
+    Ok(run(&["power-off", "--block-device", dev])
+        .err()
+        .map(|e| format!("unmounted, but not powered off ({e}); it can be unplugged")))
+}
+
+/// Runs `udisksctl` with `args`, without asking anything; its error output
+/// on failure.
+fn udisksctl(args: &[&str]) -> std::result::Result<(), String> {
+    run_tool("udisksctl", args)
+}
+
+/// [`udisksctl`] with the program named, so tests can use a fake one.
+fn run_tool(program: &str, args: &[&str]) -> std::result::Result<(), String> {
+    let out = std::process::Command::new(program)
+        .args(args)
+        .arg("--no-user-interaction")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|e| format!("udisksctl: {e}"))?;
+    if out.status.success() {
+        return Ok(());
+    }
+    let err = String::from_utf8_lossy(&out.stderr).trim().to_owned();
+    Err(if err.is_empty() {
+        format!("udisksctl {}: {}", args[0], out.status)
+    } else {
+        err
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn eject_refuses_a_folder_and_a_device_that_is_not_fiio() {
+        let folder = Found {
+            mount: crate::mounts::Mount {
+                mountpoint: PathBuf::from("/tmp/card"),
+                fstype: String::new(),
+                read_only: false,
+                root: PathBuf::from("/"),
+            },
+            source: None,
+            usb: None,
+        };
+        match eject(&folder).unwrap_err() {
+            Error::Eject(m) => assert!(m.contains("not the card of a connected X3"), "{m}"),
+            other => panic!("{other:?}"),
+        }
+        let boot = Found {
+            source: Some("/dev/nvme0n1p1".into()),
+            ..folder
+        };
+        assert!(matches!(eject(&boot), Err(Error::Eject(_))));
+    }
+
+    fn run_recording(fail: &'static [&'static str]) -> (Vec<Vec<String>>, Result<Option<String>>) {
+        let mut calls: Vec<Vec<String>> = Vec::new();
+        let r = eject_device("/dev/sdc1", &mut |a| {
+            calls.push(a.iter().map(|s| s.to_string()).collect());
+            match fail.contains(&a[0]) {
+                true => Err(format!("{} failed", a[0])),
+                false => Ok(()),
+            }
+        });
+        (calls, r)
+    }
+
+    #[test]
+    fn eject_unmounts_then_powers_off_the_same_device() {
+        let (calls, r) = run_recording(&[]);
+        assert_eq!(r.unwrap(), None);
+        assert_eq!(
+            calls,
+            vec![
+                vec!["unmount", "--block-device", "/dev/sdc1"],
+                vec!["power-off", "--block-device", "/dev/sdc1"],
+            ]
+        );
+    }
+
+    #[test]
+    fn eject_does_not_power_off_when_unmounting_fails() {
+        let (calls, r) = run_recording(&["unmount"]);
+        match r.unwrap_err() {
+            Error::Eject(m) => assert!(m.contains("could not unmount /dev/sdc1"), "{m}"),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(calls.len(), 1, "{calls:?}");
+    }
+
+    #[test]
+    fn eject_warns_when_only_power_off_fails() {
+        let (calls, r) = run_recording(&["power-off"]);
+        let warning = r.unwrap().expect("a warning");
+        assert!(
+            warning.contains("unmounted") && warning.contains("power-off failed"),
+            "{warning}"
+        );
+        assert_eq!(calls.len(), 2);
+    }
+
+    /// A script that appends its arguments to `log` and exits with `code`,
+    /// writing `err` to stderr.
+    fn fake_tool(dir: &Path, code: i32, err: &str) -> (PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let (tool, log) = (dir.join("fake-udisksctl"), dir.join("log"));
+        std::fs::write(
+            &tool,
+            format!(
+                "#!/bin/sh\necho \"$@\" >> '{}'\necho '{err}' >&2\nexit {code}\n",
+                log.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+        (tool, log)
+    }
+
+    #[test]
+    fn run_tool_adds_no_user_interaction_and_reports_failures() {
+        let _turn = crate::SPAWN.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let (tool, log) = fake_tool(dir.path(), 0, "");
+        run_tool(
+            tool.to_str().unwrap(),
+            &["unmount", "--block-device", "/dev/sdc1"],
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(log).unwrap().trim(),
+            "unmount --block-device /dev/sdc1 --no-user-interaction"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let (tool, _) = fake_tool(dir.path(), 1, "Device is busy");
+        assert_eq!(
+            run_tool(tool.to_str().unwrap(), &["unmount"]).unwrap_err(),
+            "Device is busy"
+        );
+        assert!(
+            run_tool("/nonexistent/udisksctl", &["x"])
+                .unwrap_err()
+                .starts_with("udisksctl:")
+        );
+    }
 
     /// A fake sysfs: `block/<dev>` under a USB device with the given ids.
     fn sysfs(vendor: &str, serial: &str) -> tempfile::TempDir {

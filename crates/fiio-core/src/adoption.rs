@@ -269,25 +269,7 @@ pub fn run(
 
     let (mapping, left) = adopt::resolve(&adoption, accept_proposals);
     let left: Vec<Proposal> = left.into_iter().cloned().collect();
-    // A file that could not be hashed cannot be recorded. Two files FAT
-    // would take for one (only a folder used as a card can hold them) are
-    // one place on a card: the first is kept.
-    let mut keys = HashSet::new();
-    let mut mapping: Vec<(u64, i64)> = mapping
-        .into_iter()
-        .filter(|&(k, _)| tracks[k as usize].hash.is_some())
-        .collect();
-    mapping.retain(|&(k, _)| {
-        let path = &tracks[k as usize].file.path;
-        let first = keys.insert(card_key(path));
-        if !first {
-            unreadable.push((
-                path.clone(),
-                "another card file has this name for FAT".into(),
-            ));
-        }
-        first
-    });
+    let mapping = recordable(&tracks, mapping, &mut unreadable);
     let playlists = match_playlists(conn, cfg, &contents)?;
     Ok(Run {
         key: key.to_owned(),
@@ -302,6 +284,67 @@ pub fn run(
         hashed,
         unreadable,
     })
+}
+
+/// The pairs of `mapping` that can be recorded. A file that could not be
+/// hashed cannot. Two files FAT would take for one (only a folder used as a
+/// card can hold them) are one place on a card: the first is kept, and the
+/// other noted in `unreadable`.
+fn recordable(
+    tracks: &[CardTrack],
+    mapping: Vec<(u64, i64)>,
+    unreadable: &mut Vec<(String, String)>,
+) -> Vec<(u64, i64)> {
+    let mut keys = HashSet::new();
+    let mut mapping: Vec<(u64, i64)> = mapping
+        .into_iter()
+        .filter(|&(k, _)| tracks[k as usize].hash.is_some())
+        .collect();
+    mapping.retain(|&(k, _)| {
+        let path = &tracks[k as usize].file.path;
+        let first = keys.insert(card_key(path));
+        if !first {
+            unreadable_once(
+                unreadable,
+                path,
+                "another card file has this name for FAT".into(),
+            );
+        }
+        first
+    });
+    mapping
+}
+
+/// Replaces the run's mapping with the one from a decision per proposal
+/// (see [`adopt::resolve_choices`]). A library track chosen twice is
+/// refused and the run left as it was.
+pub fn choose(r: &mut Run, choices: &HashMap<u64, Option<i64>>) -> Result<()> {
+    let (mapping, left) = match adopt::resolve_choices(&r.adoption, choices) {
+        Ok((m, l)) => (m, l.into_iter().cloned().collect::<Vec<Proposal>>()),
+        Err(conflicts) => {
+            return Err(Error::ChoiceConflicts(
+                conflicts
+                    .iter()
+                    .map(|c| {
+                        let path = r.library.get(&c.track_id).map_or_else(
+                            || c.track_id.to_string(),
+                            |t| t.path.display().to_string(),
+                        );
+                        let files: Vec<&str> = c
+                            .keys
+                            .iter()
+                            .filter_map(|k| r.tracks.get(*k as usize))
+                            .map(|t| t.file.path.as_str())
+                            .collect();
+                        format!("{path} is chosen for card files {}", files.join(", "))
+                    })
+                    .collect(),
+            ));
+        }
+    };
+    r.mapping = recordable(&r.tracks, mapping, &mut r.unreadable);
+    r.left = left;
+    Ok(())
 }
 
 /// Matches the `.m3u8` files of the card's playlists folder to library
