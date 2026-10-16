@@ -66,12 +66,17 @@ enum Command {
         #[arg(long)]
         force: bool,
     },
-    /// Plan what a sync changes on the card, and show it. Only --plan-only
-    /// in this version: writing to the card comes later.
+    /// Sync the card with the library: show the plan, ask, apply it and
+    /// check the card. This version writes playlists only
+    /// (--playlists-only); --plan-only shows the full plan.
     Sync {
         /// Show the plan and save it to plan.json; change nothing.
         #[arg(long)]
         plan_only: bool,
+        /// Leave the tracks as they are and write the playlists for the
+        /// files on the card now.
+        #[arg(long)]
+        playlists_only: bool,
         /// List every change.
         #[arg(long)]
         verbose: bool,
@@ -95,6 +100,20 @@ enum Command {
         /// one.
         #[arg(long, value_name = "KEY", global = true)]
         device: Option<String>,
+    },
+    /// List the backups of the card's playlists and fiio-tunes' record of it.
+    Backups {
+        /// The player, by its key, instead of the connected one.
+        #[arg(long, value_name = "KEY")]
+        device: Option<String>,
+    },
+    /// Put a backup back: the card's playlists and manifest, and the record
+    /// of the card. Audio files are left as they are.
+    Restore {
+        stamp: String,
+        /// Do not ask for confirmation.
+        #[arg(long)]
+        yes: bool,
     },
     /// Write test playlists to the card, to see which forms the X3 plays.
     Probe {
@@ -985,15 +1004,19 @@ fn adopt(accept_proposals: bool, force: bool) -> Result<()> {
 
 struct SyncArgs {
     plan_only: bool,
+    playlists_only: bool,
     verbose: bool,
     json: bool,
+    yes: bool,
+    allow_mass_removal: bool,
 }
 
-fn run_sync(args: SyncArgs) -> Result<()> {
-    if !args.plan_only {
+fn run_sync(args: SyncArgs) -> Result<Outcome> {
+    if !args.plan_only && !args.playlists_only {
         bail!(
-            "this version only plans: run `fiio-tunes sync --plan-only`; writing to the card \
-             comes in a later version"
+            "this version writes playlists only: run `fiio-tunes sync --playlists-only`, or \
+             `fiio-tunes sync --plan-only` to see the full plan; copying tracks comes in a \
+             later version"
         );
     }
     let (config, mut store) = load()?;
@@ -1012,7 +1035,8 @@ fn run_sync(args: SyncArgs) -> Result<()> {
     // meanwhile.
     let _lock = fiio_core::lock::card(&paths)?;
     eprintln!("reading the card at {}", found.mount.mountpoint.display());
-    let prepared = fiio_core::sync::prepare(store.conn(), &config, &found)?;
+    let prepared =
+        fiio_core::sync::prepare_with(store.conn(), &config, &found, args.playlists_only)?;
     let plan_json = serde_json::to_string_pretty(&prepared.plan)?;
     std::fs::create_dir_all(&paths.data_dir)?;
     let plan_path = paths.data_dir.join("plan.json");
@@ -1037,13 +1061,159 @@ fn run_sync(args: SyncArgs) -> Result<()> {
                 " (from [sync] in the config)"
             }
         )?;
-        writeln!(
-            out,
-            "plan saved to {}; nothing changed",
-            plan_path.display()
-        )?;
+        if args.plan_only {
+            writeln!(
+                out,
+                "plan saved to {}; nothing changed",
+                plan_path.display()
+            )?;
+        }
+    }
+    if args.plan_only {
+        return Ok(Outcome::Done);
+    }
+    let opts = fiio_core::exec::Options {
+        allow_mass_removal: args.allow_mass_removal,
+    };
+    // Refused before asking.
+    fiio_core::exec::check(&prepared, opts)?;
+    if prepared.plan.is_empty() {
+        writeln!(out, "the card is up to date; nothing to do")?;
+        return Ok(Outcome::Done);
+    }
+    out.flush()?;
+    drop(out);
+    if !args.yes && !confirm("Apply?")? {
+        return Ok(Outcome::Declined);
+    }
+    let _inhibitor = fiio_core::inhibit::hold("Writing playlists to the X3's card");
+    match fiio_core::exec::run(store.conn(), &config, &paths, &found, &prepared, opts) {
+        Ok(done) => {
+            let mut out = io::stdout().lock();
+            if done.first {
+                writeln!(out, "the card was checked as adopted and got its id")?;
+            }
+            writeln!(
+                out,
+                "playlists: {} written, {} renamed, {} removed; the card checked as planned",
+                done.written, done.renamed, done.deleted
+            )?;
+            if let Some(b) = &done.backup {
+                writeln!(out, "backup: {}", b.stamp)?;
+            }
+            for w in &done.warnings {
+                writeln!(out, "warning: {w}")?;
+            }
+            Ok(Outcome::Done)
+        }
+        Err(failed) => {
+            let hint = match &failed.backup {
+                Some(b) => format!(
+                    "the card was backed up as {} before writing; run `fiio-tunes restore {}` \
+                     before syncing again: it puts its playlists back",
+                    b.stamp, b.stamp
+                ),
+                None => "nothing was written to the card".into(),
+            };
+            Err(anyhow::Error::new(failed.error).context(hint))
+        }
+    }
+}
+
+fn run_backups(key: Option<&str>) -> Result<()> {
+    let (config, _store) = load()?;
+    let paths = paths()?;
+    let found = match key {
+        Some(_) => None,
+        None => Some(fiio_core::device::locate(&config)?),
+    };
+    let key = fiio_core::restore::device_key(&config, found.as_ref(), key)?;
+    let root = paths.data_dir.join("backups");
+    let all = fiio_core::backup::list(&root, &key)?;
+    let mut out = io::stdout().lock();
+    if all.is_empty() {
+        writeln!(out, "no backups of {key}")?;
+    }
+    for b in all {
+        let what = match fiio_core::backup::saved(&b) {
+            Ok(s) => format!(
+                "{} tracks and {} playlists mapped",
+                s.tracks.len(),
+                s.playlists.len()
+            ),
+            Err(e) => format!("unreadable: {e}"),
+        };
+        writeln!(out, "{}  {what}", b.stamp)?;
     }
     Ok(())
+}
+
+fn run_restore(stamp: &str, yes: bool) -> Result<Outcome> {
+    let (config, store) = load()?;
+    let paths = paths()?;
+    let found = fiio_core::device::locate(&config)?;
+    let _lock = fiio_core::lock::card(&paths)?;
+    let key = fiio_core::restore::device_key(&config, Some(&found), None)?;
+    let b = fiio_core::backup::find(&paths.data_dir.join("backups"), &key, stamp)?;
+    let saved = fiio_core::backup::saved(&b)?;
+    let question = format!(
+        "put back backup {stamp} on {}: its {} managed playlist files and manifest, and its \
+         record of {} tracks and {} playlists?",
+        found.mount.mountpoint.display(),
+        saved.playlists.len(),
+        saved.tracks.len(),
+        saved.playlists.len()
+    );
+    if !yes && !confirm(&question)? {
+        return Ok(Outcome::Declined);
+    }
+    let _inhibitor = fiio_core::inhibit::hold("Restoring the X3's card");
+    let r = fiio_core::restore::run(store.conn(), &config, &paths, &found, stamp).map_err(|e| {
+        let restoring = fiio_core::store::devices::device(store.conn(), &key)
+            .ok()
+            .flatten()
+            .and_then(|d| {
+                fiio_core::store::devices::restoring(store.conn(), d.id)
+                    .ok()
+                    .flatten()
+            });
+        let hint = match restoring {
+            Some(_) => {
+                "the restore stopped part way, after the card was backed up (`fiio-tunes \
+                 backups` lists it); syncs are refused until a restore succeeds"
+            }
+            None => "nothing was changed on the card",
+        };
+        anyhow::Error::new(e).context(hint)
+    })?;
+    let mut out = io::stdout().lock();
+    writeln!(
+        out,
+        "restored {stamp}: {} playlist files written, {} removed; the card was backed up first as {}",
+        r.written, r.deleted, r.before.stamp
+    )?;
+    if r.tombstones > 0 {
+        writeln!(
+            out,
+            "{} playlists deleted since are removed from the card by the next sync",
+            r.tombstones
+        )?;
+    }
+    if r.dropped > 0 {
+        writeln!(
+            out,
+            "{} mapped tracks no longer in the library were dropped",
+            r.dropped
+        )?;
+    }
+    writeln!(
+        out,
+        "audio files removed since are copied again by the next sync"
+    )?;
+    for w in &r.warnings {
+        writeln!(out, "warning: {w}")?;
+    }
+    Ok(Outcome::Done)
 }
 
 fn run_scope(set: Option<&ScopeCommand>, key: Option<&str>) -> Result<()> {
@@ -1151,16 +1321,21 @@ fn main() -> ExitCode {
         Command::Probe { clean, yes } => probe(*clean, *yes),
         Command::Sync {
             plan_only,
+            playlists_only,
             verbose,
             json,
-            yes: _,
-            allow_mass_removal: _,
+            yes,
+            allow_mass_removal,
         } => run_sync(SyncArgs {
             plan_only: *plan_only,
+            playlists_only: *playlists_only,
             verbose: *verbose,
             json: *json,
-        })
-        .map(|()| Outcome::Done),
+            yes: *yes,
+            allow_mass_removal: *allow_mass_removal,
+        }),
+        Command::Backups { device } => run_backups(device.as_deref()).map(|()| Outcome::Done),
+        Command::Restore { stamp, yes } => run_restore(stamp, *yes),
         Command::Scope { set, device } => {
             run_scope(set.as_ref(), device.as_deref()).map(|()| Outcome::Done)
         }

@@ -308,3 +308,53 @@ pub fn library_playlists(conn: &Connection) -> Result<Vec<LibPlaylist>> {
     }
     Ok(out)
 }
+
+/// Replaces the device's playlist mappings; tombstones no device maps any
+/// more go.
+pub fn replace_playlist_mappings(
+    conn: &Connection,
+    device_id: i64,
+    playlists: &[PlaylistMapping],
+) -> Result<()> {
+    crate::store::savepoint(conn, || {
+        conn.execute(
+            "DELETE FROM device_playlists WHERE device_id = ?1",
+            [device_id],
+        )?;
+        let mut stmt = conn.prepare(
+            "INSERT INTO device_playlists (device_id, playlist_id, card_name, card_key) \
+             VALUES (?1, ?2, ?3, ?4)",
+        )?;
+        for m in playlists {
+            stmt.execute(params![
+                device_id,
+                m.playlist_id,
+                m.card_name,
+                card_key(&m.card_name)
+            ])?;
+        }
+        conn.execute(
+            "DELETE FROM playlists WHERE removed_at IS NOT NULL \
+             AND id NOT IN (SELECT playlist_id FROM device_playlists)",
+            [],
+        )?;
+        Ok(())
+    })
+}
+
+pub fn set_last_sync(conn: &Connection, device_id: i64, at: i64) -> Result<()> {
+    conn.execute(
+        "UPDATE devices SET last_sync_at = ?2 WHERE id = ?1",
+        params![device_id, at],
+    )?;
+    Ok(())
+}
+
+/// Marks a restore of the device as under way (`Some(stamp)`) or done.
+pub fn set_restoring(conn: &Connection, device_id: i64, stamp: Option<&str>) -> Result<()> {
+    conn.execute(
+        "UPDATE devices SET restoring = ?2 WHERE id = ?1",
+        params![device_id, stamp],
+    )?;
+    Ok(())
+}

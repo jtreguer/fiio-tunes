@@ -45,6 +45,7 @@ struct World {
     pmap: Vec<PlaylistMapping>,
     sel: Sel,
     remove_unmanaged: bool,
+    playlists_only: bool,
     space: Option<Space>,
     music_dir: String,
     playlists_dir: String,
@@ -68,6 +69,7 @@ impl World {
             pmap: vec![],
             sel: Sel::All,
             remove_unmanaged: false,
+            playlists_only: false,
             space: None,
             music_dir: "Music".into(),
             playlists_dir: String::new(),
@@ -191,6 +193,7 @@ impl World {
                 roots: &self.roots,
             },
             card_playlists: &self.bytes,
+            playlists_only: self.playlists_only,
         })
     }
 }
@@ -1707,6 +1710,54 @@ mod random {
     }
 
     proptest! {
+        // Prevents: the playlists-only mode touching a track, depending on
+        // the order of its input, expecting a file that is not on the card,
+        // or not converging: after the expected card is reached, the next
+        // plan has nothing to do.
+        #[test]
+        fn playlists_only_plans_no_track_change_and_converges(w in arb(), by in 0usize..9) {
+            let mut w = w;
+            w.playlists_only = true;
+            let p = w.plan();
+            prop_assert!(p.copy.is_empty() && p.replace.is_empty());
+            prop_assert!(p.moves.is_empty() && p.remove.is_empty() && p.skipped.is_empty());
+            prop_assert!(p.space.fits);
+            // Expected: exactly the mapped files the card holds, by the
+            // name the card lists them under.
+            let mut want: Vec<String> = w
+                .tmap
+                .iter()
+                .filter_map(|m| {
+                    w.audio
+                        .iter()
+                        .find(|f| card_key(&f.path) == card_key(&m.card_path))
+                        .map(|f| f.path.clone())
+                })
+                .collect();
+            want.sort();
+            let got: Vec<String> = p.expected.files.iter().map(|f| f.path.clone()).collect();
+            prop_assert_eq!(got, want);
+            // Every unmanaged audio file is kept, remove_unmanaged or not.
+            let mapped: std::collections::HashSet<String> =
+                w.tmap.iter().map(|m| card_key(&m.card_path)).collect();
+            for f in w.audio.iter().filter(|f| !mapped.contains(&card_key(&f.path))) {
+                prop_assert!(
+                    p.expected.unmanaged.iter().any(|(u, _)| u == &f.path),
+                    "{} dropped from expected.unmanaged", f.path
+                );
+            }
+            prop_assert_eq!(&shuffled_world(&w, by).plan(), &p);
+            let mut applied = w.clone();
+            apply(&mut applied, &p);
+            let again = applied.plan();
+            prop_assert!(
+                again.is_empty(),
+                "copy {:?} replace {:?} moves {:?} remove {:?} playlists {:?}",
+                again.copy, again.replace, again.moves, again.remove, again.playlists
+            );
+            prop_assert_eq!(&again.expected, &p.expected);
+        }
+
         // Prevents: nondeterminism and non-convergence over many shapes of
         // library and card.
         #[test]
@@ -1724,6 +1775,220 @@ mod random {
             prop_assert_eq!(&again.expected, &p.expected);
         }
     }
+}
+
+// ------------------------------------------------------ F5: playlists only
+
+/// Every managed and unmanaged file the library could act on: a changed
+/// file, an adopted file outside `Music/`, a file gone from the library, a
+/// file out of scope, a track never copied, unmanaged audio and an
+/// unmanaged playlist, with `remove_unmanaged` on and no room on the card.
+fn tracks_world() -> World {
+    let mut w = World::new();
+    w.synced(1, "a.mp3", SIZE);
+    w.row(1).hash = [0xAA; 32];
+    w.row(1).size = 5_000;
+    w.track(2, "moved.mp3", SIZE);
+    w.map_file(2, "Elsewhere/moved.mp3", SIZE);
+    w.synced(3, "c.mp3", SIZE);
+    w.row(3).missing_since = Some(1);
+    w.synced(4, "d.mp3", SIZE);
+    // The card holds another size than the one synced: `expected` says what
+    // the card has.
+    w.audio
+        .iter_mut()
+        .find(|f| f.path == "Music/d.mp3")
+        .unwrap()
+        .size = SIZE + 9;
+    w.track(5, "e.mp3", SIZE);
+    w.card_audio("Stray/s.mp3", 12);
+    w.card_list("Theirs.m3u8", b"theirs");
+    w.list(10, "In", &some(&[1, 2, 5]));
+    w.sel = Sel::Only(names(&["In"]));
+    w.remove_unmanaged = true;
+    w.space = Some(Space {
+        capacity: 1_000,
+        free: 0,
+    });
+    w
+}
+
+// Prevents: --playlists-only touching a track whatever the library says:
+// the same world gives every kind of track operation in the normal mode
+// and none in this one; managed files stay in `expected` as the card has
+// them (size included), unmanaged audio stays even with remove_unmanaged,
+// and a plan with no track change needs no room.
+#[test]
+fn playlists_only_plans_no_track_operation_whatever_the_library_says() {
+    let mut w = tracks_world();
+    let full = w.plan();
+    assert_eq!(copied(&full), [5]);
+    assert_eq!(full.replace.len(), 1);
+    assert_eq!(full.moves.len(), 1);
+    assert!(full.remove.len() >= 3, "{:?}", full.remove);
+    assert!(!full.space.fits);
+
+    w.playlists_only = true;
+    let p = w.plan();
+    assert!(p.copy.is_empty(), "{:?}", p.copy);
+    assert!(p.replace.is_empty(), "{:?}", p.replace);
+    assert!(p.moves.is_empty(), "{:?}", p.moves);
+    assert!(p.remove.is_empty(), "{:?}", p.remove);
+    assert!(p.skipped.is_empty(), "{:?}", p.skipped);
+    assert!(p.space.fits);
+    assert_eq!(p.space.peak, 0);
+
+    let files: Vec<_> = p
+        .expected
+        .files
+        .iter()
+        .map(|f| (f.path.as_str(), f.size, f.track_id))
+        .collect();
+    assert_eq!(
+        files,
+        [
+            ("Elsewhere/moved.mp3", SIZE, 2),
+            ("Music/a.mp3", SIZE, 1),
+            ("Music/c.mp3", SIZE, 3),
+            ("Music/d.mp3", SIZE + 9, 4),
+        ]
+    );
+    assert_eq!(p.unmanaged.files, ["Stray/s.mp3"]);
+    assert_eq!(p.expected.unmanaged, [("Stray/s.mp3".to_owned(), 12)]);
+}
+
+// Prevents: the playlists naming the files where the library would put
+// them rather than where they are (an adopted file outside Music/), and an
+// entry of a track not on the card being written as a dead path.
+#[test]
+fn playlists_only_names_the_files_where_they_are_and_skips_what_is_not_there() {
+    let mut w = tracks_world();
+    w.playlists_only = true;
+    let p = w.plan();
+    assert_eq!(
+        write_text(&p, "In.m3u8"),
+        "#EXTM3U\n#EXTINF:200,Artist1 - Title1\nMusic/a.mp3\n\
+         #EXTINF:200,Artist2 - Title2\nElsewhere/moved.mp3\n"
+    );
+    assert_eq!(
+        p.entries_skipped,
+        [EntrySkipped {
+            playlist: "In".into(),
+            position: 3,
+            reason: EntryReason::NotOnCard
+        }]
+    );
+    // The unmanaged playlist is still deleted: remove_unmanaged is about
+    // playlists too.
+    assert_eq!(ops(&p), ["delete Theirs.m3u8", "write In.m3u8"]);
+    assert!(p.unmanaged.playlists.is_empty());
+    let kept: Vec<_> = p.expected.playlists.iter().map(|e| &e.path[..]).collect();
+    assert_eq!(kept, ["In.m3u8"]);
+}
+
+// Prevents: a mapping whose card file is gone being trusted (it would be
+// listed as a managed file the verification then expects), or copied
+// again; in or out of scope it is only reported.
+#[test]
+fn playlists_only_reports_stale_mappings_and_does_not_expect_them() {
+    let mut w = World::new();
+    w.track(1, "a.mp3", SIZE);
+    w.map_only(1, "Music/a.mp3", SIZE);
+    w.track(2, "b.mp3", SIZE);
+    w.map_only(2, "Music/b.mp3", SIZE);
+    w.synced(3, "c.mp3", SIZE);
+    w.list(10, "In", &some(&[1, 3]));
+    w.list(11, "Other", &some(&[2]));
+    w.sel = Sel::Only(names(&["In"]));
+    w.playlists_only = true;
+    let p = w.plan();
+    assert!(p.copy.is_empty() && p.remove.is_empty());
+    assert_eq!(
+        p.stale_mappings,
+        [
+            plan::StaleMapping {
+                track_id: 1,
+                card_path: "Music/a.mp3".into()
+            },
+            plan::StaleMapping {
+                track_id: 2,
+                card_path: "Music/b.mp3".into()
+            },
+        ]
+    );
+    let files: Vec<_> = p.expected.files.iter().map(|f| f.track_id).collect();
+    assert_eq!(files, [3]);
+    assert_eq!(
+        write_text(&p, "In.m3u8"),
+        "#EXTM3U\n#EXTINF:200,Artist3 - Title3\nMusic/c.mp3\n"
+    );
+    assert_eq!(p.entries_skipped.len(), 1);
+    assert_eq!(p.entries_skipped[0].reason, EntryReason::NotOnCard);
+    assert_eq!(p.entries_skipped[0].position, 1);
+}
+
+// Prevents: the playlists naming a file by the spelling in the index rather
+// than the one the card lists (FAT keeps the case it was written with):
+// the location, and the path verification will look for, are the card's.
+#[test]
+fn playlists_only_uses_the_spelling_the_card_lists() {
+    let mut w = World::new();
+    w.track(1, "Song.mp3", SIZE);
+    w.map_only(1, "Music/Song.mp3", SIZE);
+    w.card_audio("MUSIC/SONG.MP3", SIZE);
+    w.list(10, "L", &some(&[1]));
+    w.playlists_only = true;
+    let p = w.plan();
+    assert_eq!(
+        write_text(&p, "L.m3u8"),
+        "#EXTM3U\n#EXTINF:200,Artist1 - Title1\nMUSIC/SONG.MP3\n"
+    );
+    let files: Vec<_> = p.expected.files.iter().map(|f| f.path.as_str()).collect();
+    assert_eq!(files, ["MUSIC/SONG.MP3"]);
+    assert!(p.stale_mappings.is_empty());
+}
+
+// Prevents: the playlist side of the plan changing with the option: the
+// same deletes (a tombstone, a playlist out of scope), rename and writes,
+// in the same order, as the normal mode on tracks that need no change.
+#[test]
+fn playlists_only_plans_the_playlists_as_the_normal_mode_does() {
+    let mut w = World::new();
+    w.synced(1, "a.mp3", SIZE);
+    w.synced(2, "b.mp3", SIZE);
+    w.list(1, "Out", &some(&[1]));
+    w.map_list(1, "Out.m3u8");
+    w.card_list("Out.m3u8", b"old");
+    w.removed = vec![(2, "Dead".into())];
+    w.map_list(2, "Dead.m3u8");
+    w.card_list("Dead.m3u8", b"old");
+    w.list(3, "New name", &some(&[1, 2]));
+    w.map_list(3, "Old name.m3u8");
+    w.card_list("Old name.m3u8", b"old");
+    w.list(4, "Stale", &some(&[2]));
+    w.map_list(4, "Stale.m3u8");
+    w.card_list("Stale.m3u8", b"old");
+    w.list(5, "Fresh", &some(&[2]));
+    let fresh = write_text(&w.plan(), "Fresh.m3u8").to_owned();
+    w.map_list(5, "Fresh.m3u8");
+    w.card_list("Fresh.m3u8", fresh.as_bytes());
+    w.sel = Sel::Except(names(&["Out"]));
+    let normal = w.plan();
+    w.playlists_only = true;
+    let only = w.plan();
+    assert_eq!(
+        ops(&only),
+        [
+            "delete Dead.m3u8",
+            "delete Out.m3u8",
+            "rename Old name.m3u8 New name.m3u8",
+            "write New name.m3u8",
+            "write Stale.m3u8",
+        ]
+    );
+    assert_eq!(ops(&only), ops(&normal));
+    assert_eq!(only.playlists, normal.playlists);
+    assert_eq!(only.expected.playlists, normal.expected.playlists);
 }
 
 // ------------------------------------------------- F4 follow-up: moves

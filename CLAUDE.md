@@ -14,10 +14,11 @@ its behaviour must stay identical to iprune's.
 
 ## Status
 
-F0 to F4 done (workspace, forked crates, `init`, `scan`, `playlist`, `import`,
+F0 to F5 done (workspace, forked crates, `init`, `scan`, `playlist`, `import`,
 detection, `device info`, card reading, naming, `probe`, `adopt`, the planner,
-`sync --plan-only`, `scope`; the probe not yet run on the X3, nor `adopt` on
-its card). Milestones in
+`sync --plan-only`, `scope`, `sync --playlists-only`, backups, verification,
+`restore`; nothing yet run on the X3: probe, adopt and a first sync each need
+the owner's go). Milestones in
 `docs/technical.md` section 16:
 
 | # | Deliverable | Writes to the card |

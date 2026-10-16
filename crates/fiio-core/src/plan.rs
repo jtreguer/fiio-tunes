@@ -111,6 +111,9 @@ pub struct PlanInput<'a> {
     /// The bytes of the card's `.m3u8` files in the playlists folder, by
     /// card path.
     pub card_playlists: &'a HashMap<String, Vec<u8>>,
+    /// Plan the playlists alone: every track stays as it is on the card,
+    /// and the playlists name the files there now.
+    pub playlists_only: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
@@ -495,137 +498,138 @@ pub fn plan(input: &PlanInput) -> Plan {
     };
     let on_card = |m: &TrackMapping| audio.get(&card_key(&m.card_path)).copied();
 
-    // Managed files in scope that cannot go where the library puts them (no
-    // card path, or the place is held) stay where they are, and hold their
-    // place against every other copy and move. One that stays can block
-    // another, so until nothing changes.
-    let mut held: HashSet<String> = occupied.clone();
-    let mut stays: HashSet<i64> = HashSet::new();
-    loop {
-        let mut more = false;
-        for &id in &in_scope {
-            if stays.contains(&id) {
-                continue;
-            }
-            let Some(f) = by_track.get(&id).and_then(|m| on_card(m)) else {
-                continue;
-            };
-            let here = card_key(&f.path);
-            let stuck = match target.get(&id) {
-                None => true,
-                Some(to) => {
-                    let to = card_key(to);
-                    to != here && held.contains(&to)
-                }
-            };
-            if stuck {
-                stays.insert(id);
-                held.insert(here);
-                more = true;
-            }
-        }
-        if !more {
-            break;
-        }
-    }
-
-    // Tracks. `sent` is where each track sent is on the card after the sync.
+    // Tracks. `sent` is where each track in scope is on the card after the
+    // sync, `sizes` its size there.
     let mut sent: HashMap<i64, String> = HashMap::new();
     let mut sizes: HashMap<i64, u64> = HashMap::new();
-    for &id in &in_scope {
-        let t = present[&id];
-        let mapping = by_track.get(&id).copied();
-        let file = mapping.and_then(on_card);
-        if let (Some(m), None) = (mapping, file) {
-            plan.stale_mappings.push(StaleMapping {
-                track_id: id,
-                card_path: m.card_path.clone(),
+    if input.playlists_only {
+        // The tracks stay as they are: every managed file where it is, the
+        // unmanaged ones too; playlists point at what is on the card now.
+        let mut mappings: Vec<&TrackMapping> = input.tracks_map.iter().collect();
+        mappings.sort_by(|a, b| a.card_path.cmp(&b.card_path));
+        for m in mappings {
+            let Some(f) = on_card(m) else {
+                plan.stale_mappings.push(StaleMapping {
+                    track_id: m.track_id,
+                    card_path: m.card_path.clone(),
+                });
+                continue;
+            };
+            plan.expected.files.push(ExpectedFile {
+                path: f.path.clone(),
+                size: f.size,
+                track_id: m.track_id,
             });
-        }
-        let skip = |plan: &mut Plan, reason| {
-            plan.skipped.push(Skipped {
-                track_id: id,
-                path: t.path.clone(),
-                reason,
-            })
-        };
-        let to = target.get(&id);
-        let blocked = to.is_some_and(|p| held.contains(&card_key(p)));
-        match (mapping, file) {
-            (Some(m), Some(f)) => {
-                // A protected or oversized file already there stays as it is.
-                let keep = t.drm || t.size > FAT32_MAX;
-                let changed = !keep && t.hash != m.synced_hash;
-                let changed_on_card = !keep && f.size != m.synced_size;
-                // The name as it is on the card.
-                let here = &f.path;
-                let to = match to {
-                    Some(to) if !stays.contains(&id) => to,
-                    other => {
-                        // Nowhere else to go: it stays where it is.
-                        skip(
-                            &mut plan,
-                            match other {
-                                None => SkipReason::NoCardPath,
-                                Some(_) => SkipReason::Occupied,
-                            },
-                        );
-                        here
-                    }
-                };
-                if (changed || changed_on_card) && to == here {
-                    plan.replace.push(ReplaceOp {
-                        track_id: id,
-                        from: t.path.clone(),
-                        to: here.clone(),
-                        size: t.size,
-                        old_size: f.size,
-                        reason: match changed {
-                            true => ReplaceReason::Changed,
-                            false => ReplaceReason::ChangedOnCard,
-                        },
-                    });
-                    sizes.insert(id, t.size);
-                } else if changed || changed_on_card {
-                    plan.remove.push(RemoveOp {
-                        path: f.path.clone(),
-                        track_id: Some(id),
-                        size: f.size,
-                        reason: RemoveReason::Replaced,
-                    });
-                    plan.copy.push(CopyOp {
-                        track_id: id,
-                        from: t.path.clone(),
-                        to: to.clone(),
-                        size: t.size,
-                    });
-                    sizes.insert(id, t.size);
-                } else {
-                    if to != here {
-                        plan.moves.push(MoveOp {
-                            track_id: id,
-                            from: here.clone(),
-                            to: to.clone(),
-                        });
-                    }
-                    sizes.insert(id, f.size);
-                }
-                sent.insert(id, to.clone());
+            if in_scope.contains(&m.track_id) {
+                sent.insert(m.track_id, f.path.clone());
             }
-            _ => {
-                let reason = if t.drm {
-                    Some(SkipReason::FairPlay)
-                } else if t.size > FAT32_MAX {
-                    Some(SkipReason::TooLarge)
-                } else if to.is_none() {
-                    Some(SkipReason::NoCardPath)
-                } else if blocked {
-                    Some(SkipReason::Occupied)
-                } else {
-                    None
+        }
+        for f in input
+            .card
+            .audio
+            .iter()
+            .filter(|f| !managed_keys.contains(&card_key(&f.path)))
+        {
+            plan.unmanaged.files.push(f.path.clone());
+            plan.expected.unmanaged.push((f.path.clone(), f.size));
+        }
+        plan.unmanaged.files.sort();
+    } else {
+        // Managed files in scope that cannot go where the library puts them (no
+        // card path, or the place is held) stay where they are, and hold their
+        // place against every other copy and move. One that stays can block
+        // another, so until nothing changes.
+        let mut held: HashSet<String> = occupied.clone();
+        let mut stays: HashSet<i64> = HashSet::new();
+        loop {
+            let mut more = false;
+            for &id in &in_scope {
+                if stays.contains(&id) {
+                    continue;
+                }
+                let Some(f) = by_track.get(&id).and_then(|m| on_card(m)) else {
+                    continue;
                 };
-                match (reason, to) {
-                    (None, Some(to)) => {
+                let here = card_key(&f.path);
+                let stuck = match target.get(&id) {
+                    None => true,
+                    Some(to) => {
+                        let to = card_key(to);
+                        to != here && held.contains(&to)
+                    }
+                };
+                if stuck {
+                    stays.insert(id);
+                    held.insert(here);
+                    more = true;
+                }
+            }
+            if !more {
+                break;
+            }
+        }
+
+        for &id in &in_scope {
+            let t = present[&id];
+            let mapping = by_track.get(&id).copied();
+            let file = mapping.and_then(on_card);
+            if let (Some(m), None) = (mapping, file) {
+                plan.stale_mappings.push(StaleMapping {
+                    track_id: id,
+                    card_path: m.card_path.clone(),
+                });
+            }
+            let skip = |plan: &mut Plan, reason| {
+                plan.skipped.push(Skipped {
+                    track_id: id,
+                    path: t.path.clone(),
+                    reason,
+                })
+            };
+            let to = target.get(&id);
+            let blocked = to.is_some_and(|p| held.contains(&card_key(p)));
+            match (mapping, file) {
+                (Some(m), Some(f)) => {
+                    // A protected or oversized file already there stays as it is.
+                    let keep = t.drm || t.size > FAT32_MAX;
+                    let changed = !keep && t.hash != m.synced_hash;
+                    let changed_on_card = !keep && f.size != m.synced_size;
+                    // The name as it is on the card.
+                    let here = &f.path;
+                    let to = match to {
+                        Some(to) if !stays.contains(&id) => to,
+                        other => {
+                            // Nowhere else to go: it stays where it is.
+                            skip(
+                                &mut plan,
+                                match other {
+                                    None => SkipReason::NoCardPath,
+                                    Some(_) => SkipReason::Occupied,
+                                },
+                            );
+                            here
+                        }
+                    };
+                    if (changed || changed_on_card) && to == here {
+                        plan.replace.push(ReplaceOp {
+                            track_id: id,
+                            from: t.path.clone(),
+                            to: here.clone(),
+                            size: t.size,
+                            old_size: f.size,
+                            reason: match changed {
+                                true => ReplaceReason::Changed,
+                                false => ReplaceReason::ChangedOnCard,
+                            },
+                        });
+                        sizes.insert(id, t.size);
+                    } else if changed || changed_on_card {
+                        plan.remove.push(RemoveOp {
+                            path: f.path.clone(),
+                            track_id: Some(id),
+                            size: f.size,
+                            reason: RemoveReason::Replaced,
+                        });
                         plan.copy.push(CopyOp {
                             track_id: id,
                             from: t.path.clone(),
@@ -633,63 +637,97 @@ pub fn plan(input: &PlanInput) -> Plan {
                             size: t.size,
                         });
                         sizes.insert(id, t.size);
-                        sent.insert(id, to.clone());
+                    } else {
+                        if to != here {
+                            plan.moves.push(MoveOp {
+                                track_id: id,
+                                from: here.clone(),
+                                to: to.clone(),
+                            });
+                        }
+                        sizes.insert(id, f.size);
                     }
-                    (reason, _) => skip(&mut plan, reason.unwrap_or(SkipReason::NoCardPath)),
+                    sent.insert(id, to.clone());
+                }
+                _ => {
+                    let reason = if t.drm {
+                        Some(SkipReason::FairPlay)
+                    } else if t.size > FAT32_MAX {
+                        Some(SkipReason::TooLarge)
+                    } else if to.is_none() {
+                        Some(SkipReason::NoCardPath)
+                    } else if blocked {
+                        Some(SkipReason::Occupied)
+                    } else {
+                        None
+                    };
+                    match (reason, to) {
+                        (None, Some(to)) => {
+                            plan.copy.push(CopyOp {
+                                track_id: id,
+                                from: t.path.clone(),
+                                to: to.clone(),
+                                size: t.size,
+                            });
+                            sizes.insert(id, t.size);
+                            sent.insert(id, to.clone());
+                        }
+                        (reason, _) => skip(&mut plan, reason.unwrap_or(SkipReason::NoCardPath)),
+                    }
                 }
             }
         }
-    }
 
-    // Managed files of tracks not sent go.
-    let mut mappings: Vec<&TrackMapping> = input.tracks_map.iter().collect();
-    mappings.sort_by(|a, b| a.card_path.cmp(&b.card_path));
-    for m in mappings {
-        if sent.contains_key(&m.track_id) {
-            continue;
-        }
-        let Some(f) = on_card(m) else {
-            if !in_scope.contains(&m.track_id) {
-                plan.stale_mappings.push(StaleMapping {
-                    track_id: m.track_id,
-                    card_path: m.card_path.clone(),
-                });
+        // Managed files of tracks not sent go.
+        let mut mappings: Vec<&TrackMapping> = input.tracks_map.iter().collect();
+        mappings.sort_by(|a, b| a.card_path.cmp(&b.card_path));
+        for m in mappings {
+            if sent.contains_key(&m.track_id) {
+                continue;
             }
-            continue;
-        };
-        // A track in scope that could not be sent anywhere stays put; one
-        // that is out of scope, or gone from the library, goes.
-        if in_scope.contains(&m.track_id) {
-            continue;
-        }
-        plan.remove.push(RemoveOp {
-            path: f.path.clone(),
-            track_id: Some(m.track_id),
-            size: f.size,
-            reason: match present.contains_key(&m.track_id) {
-                true => RemoveReason::OutOfScope,
-                false => RemoveReason::MissingFromLibrary,
-            },
-        });
-    }
-    let mut unmanaged_audio: Vec<&crate::card::CardFile> = input
-        .card
-        .audio
-        .iter()
-        .filter(|f| !managed_keys.contains(&card_key(&f.path)))
-        .collect();
-    unmanaged_audio.sort_by(|a, b| a.path.cmp(&b.path));
-    for f in unmanaged_audio {
-        match input.remove_unmanaged {
-            true => plan.remove.push(RemoveOp {
+            let Some(f) = on_card(m) else {
+                if !in_scope.contains(&m.track_id) {
+                    plan.stale_mappings.push(StaleMapping {
+                        track_id: m.track_id,
+                        card_path: m.card_path.clone(),
+                    });
+                }
+                continue;
+            };
+            // A track in scope that could not be sent anywhere stays put; one
+            // that is out of scope, or gone from the library, goes.
+            if in_scope.contains(&m.track_id) {
+                continue;
+            }
+            plan.remove.push(RemoveOp {
                 path: f.path.clone(),
-                track_id: None,
+                track_id: Some(m.track_id),
                 size: f.size,
-                reason: RemoveReason::Unmanaged,
-            }),
-            false => {
-                plan.unmanaged.files.push(f.path.clone());
-                plan.expected.unmanaged.push((f.path.clone(), f.size));
+                reason: match present.contains_key(&m.track_id) {
+                    true => RemoveReason::OutOfScope,
+                    false => RemoveReason::MissingFromLibrary,
+                },
+            });
+        }
+        let mut unmanaged_audio: Vec<&crate::card::CardFile> = input
+            .card
+            .audio
+            .iter()
+            .filter(|f| !managed_keys.contains(&card_key(&f.path)))
+            .collect();
+        unmanaged_audio.sort_by(|a, b| a.path.cmp(&b.path));
+        for f in unmanaged_audio {
+            match input.remove_unmanaged {
+                true => plan.remove.push(RemoveOp {
+                    path: f.path.clone(),
+                    track_id: None,
+                    size: f.size,
+                    reason: RemoveReason::Unmanaged,
+                }),
+                false => {
+                    plan.unmanaged.files.push(f.path.clone());
+                    plan.expected.unmanaged.push((f.path.clone(), f.size));
+                }
             }
         }
     }
@@ -835,7 +873,7 @@ pub fn plan(input: &PlanInput) -> Plan {
         });
     }
 
-    for (&id, path) in &sent {
+    for (&id, path) in sent.iter().filter(|_| !input.playlists_only) {
         plan.expected.files.push(ExpectedFile {
             path: path.clone(),
             size: sizes[&id],

@@ -89,6 +89,24 @@ pub enum Error {
     BadScope(String),
     #[error("the card could not be read completely ({0}); nothing planned")]
     CardIncomplete(String),
+    #[error(
+        "the plan does not fit on the card: it needs {needed} bytes at the peak, {free} are free"
+    )]
+    NoSpace { needed: i64, free: u64 },
+    #[error("the plan removes {0}; run again with --allow-mass-removal to apply it")]
+    MassRemoval(String),
+    #[error(
+        "the plan changes {0} tracks on the card, which this version does not do yet; run `fiio-tunes sync --playlists-only`"
+    )]
+    TracksLater(usize),
+    #[error("{0}: would overwrite a file; nothing more written")]
+    WouldOverwrite(String),
+    #[error("the card changed since it was adopted ({0}); adopt it again")]
+    CardChanged(String),
+    #[error("no backup {0} for this card; `fiio-tunes backups` lists them")]
+    NoSuchBackup(String),
+    #[error("backup: {0}")]
+    BadBackup(String),
     /// A file written to the card reads back wrong: exit code 3.
     #[error("verification failed: {0}")]
     VerifyFailed(String),

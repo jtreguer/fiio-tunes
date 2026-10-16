@@ -366,6 +366,72 @@ Decisions taken in F4:
 Signals, Stop, the logind inhibitor, the lock, exit codes (0 success, 1 error,
 2 usage, 3 verification failed, 4 declined) and notifications follow iprune.
 
+Decisions taken in F5, which applies playlists only:
+
+- `sync --playlists-only` plans with every track left as it is (the
+  planner's `playlists_only`): managed files stay where they are, the
+  playlists name the files on the card now, and entries whose track is not
+  there yet are left out and reported. It stays as an option once tracks
+  are synced. Until F6, `sync` without it or `--plan-only` is refused, and
+  the executor refuses a plan with track changes.
+- Refused before asking: track changes (F5), a plan that does not fit,
+  mass removals of tracks, or of playlist files (more than five and more
+  than a tenth of the managed playlists; unmanaged ones `remove_unmanaged`
+  deletes count too, since no restore puts them back), without
+  `--allow-mass-removal`. An empty plan writes nothing, not even a backup.
+- After the prompt, the card is checked again: its manifest against
+  `devices.card_id` (9.1), and for a first sync every adopted file by size
+  and BLAKE3, read again, with still no manifest.
+- The backup holds every `.m3u8` on the card under `playlists/<card path>`,
+  `manifest.json` when there is one, `mappings.json` (device key, card id,
+  track mappings with hashes, playlist mappings with the library names),
+  `plan.json`, `work.json` (`[]` until F6 logs copies) and `listing.txt`
+  (path and size of each audio and `.m3u8` file). The folder is
+  `backups/<key>/`, the key with characters other than letters, digits,
+  `.`, `-` and `_` made `_`.
+- A first sync records a new `card_id` (32 hex digits from the kernel's
+  random source) in the index, then writes the manifest, before any
+  playlist. If that manifest write fails, the index forgets the id again,
+  so the card is still the one adopted for the next try. The manifest (version 1) holds the device key, the card id, the
+  time, every managed track (path, size, BLAKE3) and the managed playlist
+  paths. It is written with `write_atomic` and read back.
+- A rename never lands on an existing file other than the same file under
+  another case (`WouldOverwrite`). A write replaces a file only where the
+  plan saw one (listed when it was made, or put there by a rename of the
+  same plan); elsewhere it creates the file and fails if one appeared
+  since the plan. Each playlist written is read back
+  through `card::read_back`. Verification compares the card with
+  `expected`, and any audio or `.m3u8` file the plan does not account for
+  is a difference too.
+- A failure after the backup names it, with the restore command to run
+  before syncing again. Once the card is written, checked and recorded, a
+  manifest that cannot be rewritten or old backups that cannot be pruned
+  are warnings, not failures.
+- `mappings.json` also records `[card] playlists_dir`, so a restore finds
+  the playlists where they were.
+
+`restore <stamp>` refuses a card that is not the one the backup or the
+index names: its manifest's card id must be the index's or the backup's;
+with no manifest, the index or the backup must have no card id, or one of
+the backup's managed playlists must be on the card (a second card in the
+same player has the same key). It checks every file of the backup before
+changing anything, backs the card up, and marks the device as restoring
+until it is done, so no sync runs on a half-restored card; a failure part
+way says so. It puts back only the playlists fiio-tunes managed at the time
+of the backup, in the folder they were in then,
+deletes the managed ones it did not hold and those the sync the backup
+was taken for created (from the backup's `plan.json`: files written or
+renamed to that were not on the card, left there when that sync failed
+before recording them), reads each file back from the card, writes back
+the manifest (or removes it, and its folder when empty, when the card had
+none) and replaces the record with the
+backup's: track mappings of library rows that still exist, playlist
+mappings, a tombstone for a library playlist gone since, and the card id.
+Old backups are then pruned. Unmanaged playlists that `remove_unmanaged`
+deleted are in the backup's `playlists/` folder; a restore does not write
+unmanaged files, so they are copied back by hand. `backups` lists a card's
+backups.
+
 ### 11.3 Verification
 
 List the card again and compare with `expected`: every managed path present
@@ -443,9 +509,9 @@ fiio-tunes import ipod [--file ITUNESDB | --mountpoint DIR] [NAME...] [--on-conf
 fiio-tunes device info
 fiio-tunes probe [--clean] [--yes]
 fiio-tunes adopt [--accept-proposals] [--force]
-fiio-tunes sync [--plan-only] [--verbose] [--json] [--yes] [--allow-mass-removal]
+fiio-tunes sync [--plan-only | --playlists-only] [--verbose] [--json] [--yes] [--allow-mass-removal]
 fiio-tunes scope [all | only PLAYLIST... | except PLAYLIST... | default]
-fiio-tunes backups
+fiio-tunes backups [--device KEY]
 fiio-tunes restore <stamp> [--yes]
 fiio-tunes doctor [--fix] [--yes]
 fiio-tunes eject

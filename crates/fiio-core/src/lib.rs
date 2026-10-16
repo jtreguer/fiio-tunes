@@ -2,10 +2,12 @@
 
 pub mod adopt;
 pub mod adoption;
+pub mod backup;
 pub mod card;
 pub mod config;
 pub mod device;
 mod error;
+pub mod exec;
 pub mod import;
 pub mod inhibit;
 pub mod ipod;
@@ -19,10 +21,12 @@ pub mod plan;
 pub mod playlist;
 pub mod playlists;
 pub mod probe;
+pub mod restore;
 pub mod scan;
 pub mod store;
 pub mod sync;
 pub mod tags;
+pub mod verify;
 
 pub use error::{Error, Result};
 

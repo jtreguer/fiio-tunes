@@ -1219,7 +1219,9 @@ fn a_size_matching_file_that_cannot_be_opened_is_listed_once() {
     let p = w.card.root.join("locked.mp3");
     fs::set_permissions(&p, fs::Permissions::from_mode(0o000)).unwrap();
     if fs::File::open(&p).is_ok() {
-        eprintln!("skipped: permissions do not stop this user (root?)");
+        eprintln!(
+            "SKIPPED: permissions do not stop this user (running as root?); this test checked nothing"
+        );
         return;
     }
     let r = w.run(true);

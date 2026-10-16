@@ -185,6 +185,17 @@ fn playlist_bytes(card: &Path, contents: &Contents, dir: &str) -> Result<HashMap
 /// Plans a sync of the card `found`, which must have been adopted. Reads
 /// the card; writes nothing.
 pub fn prepare(conn: &Connection, cfg: &Config, found: &Found) -> Result<Prepared> {
+    prepare_with(conn, cfg, found, false)
+}
+
+/// [`prepare`]; with `playlists_only`, the plan leaves every track as it is
+/// and writes the playlists for the files on the card now.
+pub fn prepare_with(
+    conn: &Connection,
+    cfg: &Config,
+    found: &Found,
+    playlists_only: bool,
+) -> Result<Prepared> {
     let card = found.mount.mountpoint.clone();
     let contents = card::read(&card)?;
     if !contents.problems.is_empty() {
@@ -242,6 +253,7 @@ pub fn prepare(conn: &Connection, cfg: &Config, found: &Found) -> Result<Prepare
             roots: &cfg.library.roots,
         },
         card_playlists: &card_playlists,
+        playlists_only,
     });
     Ok(Prepared {
         plan,
