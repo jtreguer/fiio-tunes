@@ -413,7 +413,9 @@ pub fn save(
 pub fn reason(r: Reason) -> &'static str {
     match r {
         Reason::WeakTags => "same size and duration, title or artist differ",
-        Reason::SeveralCandidates => "several identical library files",
+        Reason::SeveralCandidates => {
+            "several library files match it equally (duplicates in the library)"
+        }
         Reason::SharedWithAnotherDeviceTrack => {
             "another card file matched the same library file (a duplicate on the card)"
         }

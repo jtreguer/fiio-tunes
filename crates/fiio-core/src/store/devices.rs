@@ -3,8 +3,10 @@
 
 use rusqlite::{Connection, OptionalExtension, params};
 
-use crate::Result;
+use crate::config::Scope;
 use crate::paths::card_key;
+use crate::plan::LibPlaylist;
+use crate::{Error, Result};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeviceRow {
@@ -184,4 +186,125 @@ pub fn playlist_mappings(conn: &Connection, device_id: i64) -> Result<Vec<Playli
         })?
         .collect::<rusqlite::Result<_>>()?;
     Ok(rows)
+}
+
+/// A device's own sync scope.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceScope {
+    pub kind: Scope,
+    pub playlists: Vec<String>,
+}
+
+/// The scope set for the device; `None` when it follows `[sync]`.
+pub fn scope(conn: &Connection, device_id: i64) -> Result<Option<DeviceScope>> {
+    let kind: Option<String> = conn.query_row(
+        "SELECT scope FROM devices WHERE id = ?1",
+        [device_id],
+        |r| r.get(0),
+    )?;
+    let kind = match kind.as_deref() {
+        None => return Ok(None),
+        Some("all") => Scope::All,
+        Some("playlists") => Scope::Playlists,
+        Some("except") => Scope::Except,
+        Some(other) => {
+            return Err(Error::BadScope(format!(
+                "the index holds an unknown scope {other:?} for this player"
+            )));
+        }
+    };
+    let mut stmt =
+        conn.prepare("SELECT name FROM device_scope_playlists WHERE device_id = ?1 ORDER BY name")?;
+    let playlists = stmt
+        .query_map([device_id], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(Some(DeviceScope { kind, playlists }))
+}
+
+/// Sets the device's scope; `None` makes it follow `[sync]` again.
+pub fn set_scope(conn: &Connection, device_id: i64, scope: Option<&DeviceScope>) -> Result<()> {
+    crate::store::savepoint(conn, || {
+        let kind = scope.map(|s| match s.kind {
+            Scope::All => "all",
+            Scope::Playlists => "playlists",
+            Scope::Except => "except",
+        });
+        conn.execute(
+            "UPDATE devices SET scope = ?2 WHERE id = ?1",
+            params![device_id, kind],
+        )?;
+        conn.execute(
+            "DELETE FROM device_scope_playlists WHERE device_id = ?1",
+            [device_id],
+        )?;
+        for name in scope
+            .filter(|s| s.kind != Scope::All)
+            .map(|s| s.playlists.as_slice())
+            .unwrap_or_default()
+        {
+            conn.execute(
+                "INSERT OR IGNORE INTO device_scope_playlists (device_id, name) VALUES (?1, ?2)",
+                params![device_id, name],
+            )?;
+        }
+        Ok(())
+    })
+}
+
+pub fn devices(conn: &Connection) -> Result<Vec<DeviceRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, device_key, card_id, name, model, last_sync_at FROM devices ORDER BY id",
+    )?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok(DeviceRow {
+                id: r.get(0)?,
+                device_key: r.get(1)?,
+                card_id: r.get(2)?,
+                name: r.get(3)?,
+                model: r.get(4)?,
+                last_sync_at: r.get(5)?,
+            })
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(rows)
+}
+
+/// The device's unfinished restore, by stamp.
+pub fn restoring(conn: &Connection, device_id: i64) -> Result<Option<String>> {
+    Ok(conn.query_row(
+        "SELECT restoring FROM devices WHERE id = ?1",
+        [device_id],
+        |r| r.get(0),
+    )?)
+}
+
+/// Every playlist with a file, its entries resolved to track ids.
+pub fn library_playlists(conn: &Connection) -> Result<Vec<LibPlaylist>> {
+    let mut stmt = conn.prepare(
+        "SELECT p.id, p.name, i.position, i.track_id FROM playlists p \
+         LEFT JOIN playlist_items i ON i.playlist_id = p.id WHERE p.removed_at IS NULL \
+         ORDER BY p.name, i.position",
+    )?;
+    let mut out: Vec<LibPlaylist> = Vec::new();
+    let mut rows = stmt.query([])?;
+    while let Some(r) = rows.next()? {
+        let id: i64 = r.get(0)?;
+        if out.last().is_none_or(|p| p.id != id) {
+            out.push(LibPlaylist {
+                id,
+                name: r.get(1)?,
+                members: Vec::new(),
+            });
+        }
+        // An empty playlist gives one row with no position: no member. An
+        // unresolved entry has a position and no track: a `None` member.
+        if r.get::<_, Option<i64>>(2)?.is_some() {
+            out.last_mut()
+                .expect("pushed above")
+                .members
+                .push(r.get(3)?);
+        }
+    }
+    Ok(out)
 }

@@ -15,11 +15,13 @@ pub mod manifest;
 pub mod mounts;
 pub mod naming;
 pub mod paths;
+pub mod plan;
 pub mod playlist;
 pub mod playlists;
 pub mod probe;
 pub mod scan;
 pub mod store;
+pub mod sync;
 pub mod tags;
 
 pub use error::{Error, Result};

@@ -108,6 +108,12 @@ fn nth(name: &str, n: usize, is_file: bool) -> String {
     fit(stem, &suffix, ext)
 }
 
+/// The `n`-th spelling of the file name `name`: itself for 1, then ` (n)`
+/// before its extension, fitted in 255 UTF-16 units.
+pub fn numbered(name: &str, n: usize) -> String {
+    nth(name, n, true)
+}
+
 /// The cleaned names of `path` relative to `root`, or `None` when it is not
 /// under it, is the root itself, or is not UTF-8.
 fn components(root: &Path, path: &Path) -> Option<Vec<String>> {

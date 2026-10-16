@@ -75,6 +75,20 @@ pub enum Error {
     ForeignManifest { found: String, key: String },
     #[error("{0} was adopted already; run again with --force to replace its mappings")]
     AlreadyAdopted(String),
+    #[error("{0} has not been adopted; run `fiio-tunes adopt` first")]
+    NotAdopted(String),
+    #[error(
+        "{key} was adopted with nothing matched, and the card holds {files} audio files: a sync would copy their songs a second time. Adopt it again once the library holds them, or remove them"
+    )]
+    NothingMatched { key: String, files: usize },
+    #[error("a restore of this card ({0}) is unfinished; run `fiio-tunes restore {0}` again")]
+    RestoreUnfinished(String),
+    #[error("this card is not the one adopted ({0}); adopt it again")]
+    WrongCard(String),
+    #[error("{0}")]
+    BadScope(String),
+    #[error("the card could not be read completely ({0}); nothing planned")]
+    CardIncomplete(String),
     /// A file written to the card reads back wrong: exit code 3.
     #[error("verification failed: {0}")]
     VerifyFailed(String),

@@ -299,6 +299,48 @@ rendered playlist bytes. `Plan`:
 Scope rules, `prepare`'s refusals and the mass-removal guards (more than five
 and more than a tenth) are iprune's.
 
+Decisions taken in F4:
+
+- Card paths are computed by `naming::card_paths` over every present
+  library track, not only those in scope, so a change of scope moves
+  nothing. A track's root is the longest library root holding it.
+- A mapped card file whose size is not its `synced_size` was changed on
+  the card: it is copied again (`replace`, reason `changed_on_card`). A
+  FairPlay or 4 GiB file already on the card stays as it is; one not there
+  yet is skipped. The X3 has no sample-rate limit to skip for.
+- A target path held by an unmanaged card file (FAT key) is never written:
+  a track to copy is skipped (`occupied`) and a managed file to move stays
+  where it is. With `remove_unmanaged` the unmanaged file goes first. A
+  mapped track under no library root (`no_card_path`) also stays in place.
+  A managed file that stays holds its path in turn: no other copy or move
+  goes there (computed until nothing changes, since one file staying can
+  keep another in place).
+- Moves come in an order the executor follows as given: a move whose
+  target another move still has to free comes after it. A cycle (a swap)
+  is broken by a first move to a hidden name next to the source
+  (`.fiio-tunes-move-<n>.move`) and a last one from it. Playlist renames are
+  ordered the same way (`.fiio-tunes-move-<n>.m3u8`). Paths of files on the
+  card are taken from the card listing, as they are written there.
+- Playlists: the file name of 9.5 also avoids the names of unmanaged
+  `.m3u8` files kept in the playlists folder: fiio-tunes never takes over a
+  card playlist it did not write. `.m3u8` files elsewhere on the card are
+  unmanaged. A renamed playlist gets a `Rename` and, if its bytes differ, a
+  `Write` under its new name. A playlist name starting with `.` gets `_`
+  instead, since the card listing skips hidden files. Changing
+  `[card] playlists_dir` leaves the playlists written in the old folder:
+  they are unmanaged from then on (kept, or removed with
+  `remove_unmanaged`), and new ones are written in the new folder.
+- `prepare` refuses, besides iprune's cases: a card listing with problems
+  (an unreadable folder would look like missing files), and a card whose
+  manifest does not agree with `devices.card_id` (the read-only part of
+  9.1), checked before anything else about the device. An adopted card
+  with no mapping but with audio files is refused, as in iprune.
+- The mass-removal guard counts managed tracks removed because they left
+  the scope or the library; the old file of a replace that changes path is
+  not counted.
+- Until F5, `sync` without `--plan-only` is refused. `scope` sets the
+  connected player's own scope (`--device KEY` for another), as in iprune.
+
 ### 11.2 Executor
 
 1. Refuse: not writable (9.1), wrong manifest, a restore unfinished, a plan
@@ -336,7 +378,9 @@ byte for byte, every unmanaged file as before. Any difference is printed (up to
 `restore <stamp>` puts back the backup's playlist files and manifest and
 replaces the mappings with the backup's; audio files removed since are
 copied again by the next sync. `doctor [--fix]` reports and repairs: `.part`
-files (deleted), card audio no mapping names (moved to
+files (deleted), `.fiio-tunes-move-<n>` files a sync stopped between the
+hops of a move cycle left (renamed to the path the work log gives them),
+card audio no mapping names (moved to
 `.fiio-tunes/orphans/<stamp>/`), mappings whose file is gone (dropped), library
 rows missing for 30 days and on no device (dropped).
 

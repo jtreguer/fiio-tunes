@@ -66,6 +66,36 @@ enum Command {
         #[arg(long)]
         force: bool,
     },
+    /// Plan what a sync changes on the card, and show it. Only --plan-only
+    /// in this version: writing to the card comes later.
+    Sync {
+        /// Show the plan and save it to plan.json; change nothing.
+        #[arg(long)]
+        plan_only: bool,
+        /// List every change.
+        #[arg(long)]
+        verbose: bool,
+        /// Print the plan as JSON.
+        #[arg(long)]
+        json: bool,
+        /// Do not ask for confirmation.
+        #[arg(long)]
+        yes: bool,
+        /// Apply a plan that removes more than a tenth of the managed tracks.
+        #[arg(long)]
+        allow_mass_removal: bool,
+    },
+    /// Show or set what the X3 syncs: the whole library, only some
+    /// playlists, or all but some. One never set follows [sync] in the
+    /// config.
+    Scope {
+        #[command(subcommand)]
+        set: Option<ScopeCommand>,
+        /// The player, by its key (`usb:<serial>`), instead of the connected
+        /// one.
+        #[arg(long, value_name = "KEY", global = true)]
+        device: Option<String>,
+    },
     /// Write test playlists to the card, to see which forms the X3 plays.
     Probe {
         /// Remove the probe's files from the card instead.
@@ -75,6 +105,24 @@ enum Command {
         #[arg(long)]
         yes: bool,
     },
+}
+
+#[derive(Subcommand)]
+enum ScopeCommand {
+    /// Sync the whole library.
+    All,
+    /// Sync only these playlists and their tracks.
+    Only {
+        #[arg(required = true)]
+        playlists: Vec<String>,
+    },
+    /// Sync the whole library but these playlists and their tracks.
+    Except {
+        #[arg(required = true)]
+        playlists: Vec<String>,
+    },
+    /// Follow [sync] in the config again.
+    Default,
 }
 
 #[derive(Subcommand)]
@@ -935,6 +983,138 @@ fn adopt(accept_proposals: bool, force: bool) -> Result<()> {
     Ok(())
 }
 
+struct SyncArgs {
+    plan_only: bool,
+    verbose: bool,
+    json: bool,
+}
+
+fn run_sync(args: SyncArgs) -> Result<()> {
+    if !args.plan_only {
+        bail!(
+            "this version only plans: run `fiio-tunes sync --plan-only`; writing to the card \
+             comes in a later version"
+        );
+    }
+    let (config, mut store) = load()?;
+    let paths = paths()?;
+    let r = scan_with_progress(&config, &mut store)?;
+    eprintln!(
+        "library: {} unchanged, {} added, {} updated, {} moved, {} missing",
+        r.unchanged,
+        r.added,
+        r.updated + r.returned,
+        r.moved.len(),
+        r.missing.len()
+    );
+    let found = fiio_core::device::locate(&config)?;
+    // Held while the card is read, so another fiio-tunes cannot change it
+    // meanwhile.
+    let _lock = fiio_core::lock::card(&paths)?;
+    eprintln!("reading the card at {}", found.mount.mountpoint.display());
+    let prepared = fiio_core::sync::prepare(store.conn(), &config, &found)?;
+    let plan_json = serde_json::to_string_pretty(&prepared.plan)?;
+    std::fs::create_dir_all(&paths.data_dir)?;
+    let plan_path = paths.data_dir.join("plan.json");
+    std::fs::write(&plan_path, &plan_json)
+        .with_context(|| format!("writing {}", plan_path.display()))?;
+    let mut out = io::stdout().lock();
+    if args.json {
+        writeln!(out, "{plan_json}")?;
+    } else {
+        write!(
+            out,
+            "{}",
+            fiio_core::sync::describe(&prepared, args.verbose)
+        )?;
+        writeln!(
+            out,
+            "syncs {}{}",
+            prepared.scope.0.describe(),
+            if prepared.scope.1 {
+                ""
+            } else {
+                " (from [sync] in the config)"
+            }
+        )?;
+        writeln!(
+            out,
+            "plan saved to {}; nothing changed",
+            plan_path.display()
+        )?;
+    }
+    Ok(())
+}
+
+fn run_scope(set: Option<&ScopeCommand>, key: Option<&str>) -> Result<()> {
+    use fiio_core::store::devices::{self, DeviceScope};
+    use fiio_core::sync;
+    let (config, store) = load()?;
+    let conn = store.conn();
+    let (key, card) = match key {
+        Some(k) => (k.to_owned(), None),
+        None => {
+            let found = fiio_core::device::locate(&config)?;
+            let manifest = fiio_core::manifest::identity(&found.mount.mountpoint)?;
+            let key = fiio_core::adoption::device_key(
+                &found,
+                manifest.as_ref(),
+                config.device.allow_folder,
+            )?;
+            (key, Some(found.mount.mountpoint))
+        }
+    };
+    let device =
+        devices::device(conn, &key)?.ok_or_else(|| fiio_core::Error::NotAdopted(key.clone()))?;
+    playlists::sync_from_disk(conn, &config, false)?;
+    let library = fiio_core::store::all_tracks(conn)?;
+    let lists = devices::library_playlists(conn)?;
+    let chosen = |kind, names: &[String]| {
+        let mut playlists = names.to_vec();
+        playlists.sort();
+        playlists.dedup();
+        DeviceScope { kind, playlists }
+    };
+    use fiio_core::config::Scope as Kind;
+    let new = match set {
+        None => None,
+        Some(ScopeCommand::All) => Some(Some(chosen(Kind::All, &[]))),
+        Some(ScopeCommand::Only { playlists }) => Some(Some(chosen(Kind::Playlists, playlists))),
+        Some(ScopeCommand::Except { playlists }) => Some(Some(chosen(Kind::Except, playlists))),
+        Some(ScopeCommand::Default) => Some(None),
+    };
+    if let Some(new) = new {
+        if let Some(why) = new
+            .as_ref()
+            .and_then(|s| sync::scope_problem(s, true, &library, &lists))
+        {
+            bail!("{why}; nothing changed");
+        }
+        devices::set_scope(conn, device.id, new.as_ref())?;
+    }
+    let (scope, own) = sync::device_scope(conn, &config, device.id)?;
+    let mut out = io::stdout().lock();
+    writeln!(
+        out,
+        "{} ({})",
+        device.name.as_deref().unwrap_or("X3"),
+        device.device_key
+    )?;
+    let from = if own {
+        "set for this player"
+    } else {
+        "from [sync] in the config"
+    };
+    writeln!(out, "syncs {}, {from}", scope.describe())?;
+    let (tracks, bytes) = scope.size(&library, &lists);
+    let room = card
+        .and_then(|c| fiio_core::device::space(&c).ok())
+        .map(|(capacity, _)| format!("; the card holds {}", sync::bytes(capacity)))
+        .unwrap_or_default();
+    writeln!(out, "{tracks} tracks, {}{room}", sync::bytes(bytes))?;
+    Ok(())
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let result = match &cli.command {
@@ -969,6 +1149,21 @@ fn main() -> ExitCode {
         .map(|()| Outcome::Done),
         Command::Device(DeviceCommand::Info) => device_info().map(|()| Outcome::Done),
         Command::Probe { clean, yes } => probe(*clean, *yes),
+        Command::Sync {
+            plan_only,
+            verbose,
+            json,
+            yes: _,
+            allow_mass_removal: _,
+        } => run_sync(SyncArgs {
+            plan_only: *plan_only,
+            verbose: *verbose,
+            json: *json,
+        })
+        .map(|()| Outcome::Done),
+        Command::Scope { set, device } => {
+            run_scope(set.as_ref(), device.as_deref()).map(|()| Outcome::Done)
+        }
         Command::Adopt {
             accept_proposals,
             force,

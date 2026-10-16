@@ -444,6 +444,7 @@ dependencies = [
  "clap",
  "fiio-core",
  "rusqlite",
+ "serde_json",
  "tempfile",
 ]
 
