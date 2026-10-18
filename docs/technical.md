@@ -247,9 +247,25 @@ look at (no `List` text possible, the artists, the last entry). The same checkli
 separator, the BOM, the line endings and the extension, and is recorded
 here. Until then the defaults are variant 1.
 
-Results: the first probe (one file for every variant) ran on 2026-10-18 and
-told nothing; the owner could not tell which entries played. The second
-has not run yet.
+Results, X3 2nd gen with firmware 2.0 (its last):
+
+- The first probe (one file for every variant) ran on 2026-10-18 and told
+  nothing; the owner could not tell which entries played.
+- The second ran on 2026-10-18. Variant 1 works: the playlist, listed in
+  Browse Files, shows its entry as the path written in it
+  (`Music/zz-probe/01 Probe.mp3`), and the X3 plays it, showing the file's
+  ID3v2.3 title ("Probe 01 basic"). So the X3 matches long file names (the
+  short name is `01PROB~1.MP3`), reads ID3v2.3 Latin-1 text, and does not
+  use `#EXTINF` text. As FiiO says, these playlists are never listed in the
+  X3's own Playlists menu.
+- The other variants were not checked: the owner chose to keep variant 1,
+  FiiO's documented form, and settle the rest in use. Card playlists are
+  written as variant 1: `[card] playlists_dir = ""`, `/`, UTF-8 without a
+  BOM, LF, `#EXTM3U` and `#EXTINF`.
+- Not known yet: whether paths with accents or CJK characters resolve,
+  whether a path over 200 characters does, and how long a playlist the X3
+  takes. The first sync of a small scope (section 15) includes a playlist
+  with accented names to find out.
 
 ### 9.5 Card playlists
 
