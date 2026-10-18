@@ -923,7 +923,8 @@ fn probe(clean: bool, yes: bool) -> Result<Outcome> {
     let plan = probe::plan(secs);
     writeln!(
         out,
-        "The probe writes to {}:\n  {} copies of {} ({}) in Music/zz-probe/\n  {} playlists:",
+        "The probe writes to {}:\n  {} copies of {} ({}) in Music/zz-probe/, each tagged with \
+         the title of its variant\n  {} playlists:",
         card.display(),
         plan.audio.len(),
         src.path.display(),
@@ -944,20 +945,17 @@ fn probe(clean: bool, yes: bool) -> Result<Outcome> {
         w.files,
         size_text(w.bytes)
     )?;
-    writeln!(
-        out,
-        "the card holds \"04 é.mp3\" and \"04 É.mp3\" as {}",
-        if w.case_pair_kept {
-            "two files"
-        } else {
-            "one file"
-        }
-    )?;
-    writeln!(
-        out,
-        "On the X3: Browse Files, open each zz-probe playlist and note which play. \
-         Then `fiio-tunes probe --clean`."
-    )?;
+    let list = probe::checklist(&plan);
+    let saved = probe::checklist_path(&record);
+    writeln!(out, "\n{list}")?;
+    match std::fs::write(&saved, &list) {
+        Ok(()) => writeln!(out, "This list is saved in {}", saved.display())?,
+        Err(e) => writeln!(
+            out,
+            "(could not save this list to {}: {e})",
+            saved.display()
+        )?,
+    }
     Ok(Outcome::Done)
 }
 

@@ -80,6 +80,11 @@ impl Sandbox {
         self.base().join("data/fiio-tunes/probe.toml")
     }
 
+    /// Where the probe saves what the owner checks on the X3.
+    fn checklist(&self) -> PathBuf {
+        self.base().join("data/fiio-tunes/probe-checklist.txt")
+    }
+
     fn edit_config(&self, f: impl FnOnce(&mut Config)) {
         let mut c = Config::load(&self.config_file()).unwrap();
         f(&mut c);
@@ -317,23 +322,24 @@ fn probe_then_clean_leaves_the_card_as_it_was() {
     let o = sb.run(&["probe", "--yes"]);
     assert_ok(&o);
     let text = out(&o);
-    assert!(text.contains("12 playlists:"), "{text}");
+    assert!(text.contains("14 playlists:"), "{text}");
     assert!(text.contains("zz-probe-12.m3u8"), "{text}");
-    assert!(text.contains("wrote 18 files"), "{text}");
-    assert!(
-        text.contains("\"04 é.mp3\" and \"04 É.mp3\" as two files"),
-        "{text}"
-    );
+    assert!(text.contains("wrote 30 files"), "{text}");
     let after = sb.card_tree();
     let added: Vec<&String> = after.keys().filter(|k| !before.contains_key(*k)).collect();
     assert_eq!(
         added.iter().filter(|k| k.ends_with(".m3u8")).count(),
-        12,
+        13,
+        "{added:?}"
+    );
+    assert_eq!(
+        added.iter().filter(|k| k.ends_with(".m3u")).count(),
+        1,
         "{added:?}"
     );
     assert_eq!(
         added.iter().filter(|k| k.ends_with(".mp3")).count(),
-        6,
+        16,
         "{added:?}"
     );
     for (k, v) in &before {
@@ -343,22 +349,44 @@ fn probe_then_clean_leaves_the_card_as_it_was() {
     let first = String::from_utf8(after["zz-probe-01.m3u8"].clone().unwrap()).unwrap();
     assert!(first.starts_with("#EXTM3U\n#EXTINF:"), "{first}");
     assert!(
-        first.ends_with("fiio-tunes - Probe 01\nMusic/zz-probe/01 Probe.mp3\n"),
+        first.ends_with("List 01 basic\nMusic/zz-probe/01 Probe.mp3\n"),
         "{first}"
     );
     assert!(sb.record().is_file());
-    // A copy is a copy of the library file.
+    // A copy is the library file with its tags replaced by the variant's:
+    // an ID3v2.3 tag, then the audio of the library file, all of it.
     let src = fs::read(sb.music.join("t1.mp3")).unwrap();
+    let copy = after["Music/zz-probe/01 Probe.mp3"].clone().unwrap();
     assert_eq!(
-        after["Music/zz-probe/01 Probe.mp3"].as_deref(),
-        Some(&src[..])
+        copy,
+        fiio_core::probe::tagged(&src, "Probe 01 basic", "fiio-tunes").unwrap()
     );
+    assert_eq!(&copy[..4], b"ID3\x03");
+    assert_ne!(copy, src);
+    assert_ne!(
+        after["Music/zz-probe/02 Probe.mp3"].as_deref(),
+        Some(&copy[..]),
+        "two variants share a file"
+    );
+    // The checklist is printed, and saved as it was printed.
+    let saved = fs::read_to_string(sb.checklist()).unwrap();
+    assert!(text.contains(saved.trim_end()), "{text}");
+    for p in [
+        "zz-probe-01.m3u8",
+        "Playlists/zz-probe-09.m3u8",
+        "zz-probe-13.m3u",
+    ] {
+        assert!(saved.contains(p), "{p} is not in the checklist: {saved}");
+    }
+    assert!(saved.contains("Probe 14 same folder"), "{saved}");
+    assert!(text.contains(s(&sb.checklist())), "{text}");
 
     let o = sb.run(&["probe", "--clean", "--yes"]);
     assert_ok(&o);
-    assert!(out(&o).contains("removed 18 files"), "{}", out(&o));
+    assert!(out(&o).contains("removed 30 files"), "{}", out(&o));
     assert_eq!(sb.card_tree(), before);
     assert!(!sb.record().exists());
+    assert!(!sb.checklist().exists(), "the checklist outlived the probe");
     assert_eq!(tree(&sb.music), library, "the library was touched");
 }
 
@@ -393,6 +421,7 @@ fn probe_without_yes_and_without_a_terminal_asks_for_yes_and_writes_nothing() {
     assert_code(&o, 1);
     assert!(err(&o).contains("--yes"), "{}", err(&o));
     assert_eq!(sb.card_tree(), probed);
+    assert!(sb.checklist().is_file(), "the checklist went with no clean");
 }
 
 // Prevents: a second `probe` stacking onto the first (or printing a plan it
@@ -412,11 +441,16 @@ fn a_second_probe_refuses_before_printing_the_plan() {
     assert_eq!(fs::read(sb.record()).unwrap(), record);
     // Even one probe file is enough to refuse.
     assert_ok(&sb.run(&["probe", "--clean", "--yes"]));
+    assert!(!sb.checklist().exists());
     fs::write(sb.card.join("zz-probe-12.m3u8"), b"old").unwrap();
     let o = sb.run(&["probe", "--yes"]);
     assert_code(&o, 1);
     assert!(out(&o).is_empty(), "{}", out(&o));
     assert_eq!(sb.card_tree().len(), 1);
+    assert!(
+        !sb.checklist().exists(),
+        "a refused probe saved a checklist"
+    );
 }
 
 // Prevents: the safety check being bypassed by a plain folder: without
@@ -445,6 +479,7 @@ fn probe_is_refused_on_a_plain_folder_without_allow_folder() {
     assert!(err(&o).contains(s(&sb.card)), "{}", err(&o));
     assert_eq!(sb.card_tree(), probed);
     assert_eq!(fs::read(sb.record()).unwrap(), record);
+    assert!(sb.checklist().is_file(), "the checklist went with no clean");
 }
 
 // Prevents: the probe copying something that is not an MP3 (or nothing at
@@ -461,6 +496,25 @@ fn probe_without_an_mp3_in_the_library_fails_and_writes_nothing() {
     assert!(err(&o).contains("MP3"), "{}", err(&o));
     assert_eq!(sb.card_tree(), before);
     assert!(!sb.record().exists());
+}
+
+// Prevents: an MP3 the tagger cannot rewrite (here the only MP3 of the
+// library, now a text file) leaving part of a probe on the card, a
+// record, or a checklist for a probe that was never written.
+#[test]
+fn probe_of_a_library_mp3_that_cannot_be_tagged_fails_and_writes_nothing() {
+    let sb = Sandbox::new(1);
+    // Indexed as an MP3, then replaced behind the index's back.
+    fs::write(sb.music.join("t1.mp3"), b"this is not audio").unwrap();
+    seed_card(&sb);
+    let before = sb.card_tree();
+    let o = sb.run(&["probe", "--yes"]);
+    assert_code(&o, 1);
+    assert!(err(&o).contains("t1.mp3"), "{}", err(&o));
+    assert!(!out(&o).contains("wrote "), "{}", out(&o));
+    assert_eq!(sb.card_tree(), before);
+    assert!(!sb.record().exists());
+    assert!(!sb.checklist().exists());
 }
 
 // Prevents: a refused plan (the owner answers no) writing anyway, and the
@@ -490,6 +544,7 @@ fn answering_no_at_the_prompt_exits_4_and_writes_nothing() {
     assert_code(&o, 4);
     assert_eq!(sb.card_tree(), before);
     assert!(!sb.record().exists());
+    assert!(!sb.checklist().exists());
 
     // And "yes" at the same prompt does write.
     let o = sb.run_tty(&["probe"], "y\n").unwrap();
@@ -502,6 +557,7 @@ fn answering_no_at_the_prompt_exits_4_and_writes_nothing() {
     assert_code(&o, 4);
     assert_eq!(sb.card_tree(), probed);
     assert!(sb.record().is_file());
+    assert!(sb.checklist().is_file(), "declining a clean removed it");
 }
 
 // Prevents: a copy that reads back wrong being reported as an ordinary
@@ -514,10 +570,10 @@ fn a_copy_that_reads_back_wrong_exits_3() {
     let mut last = String::new();
     for attempt in 0..8 {
         let sb = Sandbox::new(1);
-        // The library MP3 grows by 64 MB of padding after its tags and audio.
+        // The library MP3 grows to 24 MB of padding after its tags and audio.
         let big = sb.music.join("t1.mp3");
         let mut bytes = fs::read(&big).unwrap();
-        bytes.resize(bytes.len() + (64 << 20), 0);
+        bytes.resize(24 << 20, 0);
         fs::write(&big, bytes).unwrap();
         assert_ok(&sb.run(&["scan"]));
         let target = sb.card.join("Music/zz-probe/01 Probe.mp3");
@@ -538,6 +594,7 @@ fn a_copy_that_reads_back_wrong_exits_3() {
         if code(&o) == 3 {
             assert!(err(&o).contains("01 Probe.mp3"), "{}", err(&o));
             assert!(!out(&o).contains("wrote "), "{}", out(&o));
+            assert!(!sb.checklist().exists(), "a checklist for a failed probe");
             let t = sb.card_tree();
             assert!(!t.keys().any(|k| k.ends_with(".m3u8")), "{:?}", t.keys());
             // And the half probe is cleaned the usual way.
@@ -574,6 +631,25 @@ fn probe_refuses_before_the_plan_when_the_record_names_another_card() {
     sb.edit_config(|c| c.device.mountpoint = second.clone());
     assert_ok(&sb.run(&["probe", "--yes"]));
     assert!(second.join("zz-probe-01.m3u8").is_file());
+}
+
+// Prevents: `--clean` of a second card, while the record names the first
+// card's probe, deleting the first probe's checklist.
+#[test]
+fn cleaning_another_card_keeps_the_checklist_of_the_probe_on_the_first() {
+    let sb = Sandbox::new(1);
+    assert_ok(&sb.run(&["probe", "--yes"]));
+    let list = fs::read(sb.checklist()).unwrap();
+    let second = sb.base().join("card2");
+    fs::create_dir(&second).unwrap();
+    sb.edit_config(|c| c.device.mountpoint = second.clone());
+    assert_ok(&sb.run(&["probe", "--clean", "--yes"]));
+    assert_eq!(fs::read(sb.checklist()).unwrap(), list);
+    assert!(sb.record().is_file());
+    sb.edit_config(|c| c.device.mountpoint = sb.card.clone());
+    assert_ok(&sb.run(&["probe", "--clean", "--yes"]));
+    assert!(!sb.checklist().exists() && !sb.record().exists());
+    assert!(sb.card_tree().is_empty());
 }
 
 // Prevents: a card folder spelled `music` (FAT keeps the case it was given,

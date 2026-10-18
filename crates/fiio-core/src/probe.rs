@@ -1,13 +1,18 @@
 //! The probe (technical document, section 9.4): playlists in every form the
 //! X3 might read, written once to the card so the owner can see on the
-//! player which ones play. The files they point at are copies of one small
-//! MP3 from the library, under names that try accents, CJK, a pair of
-//! names FAT might take for one, and a long path. Everything the probe
+//! player which ones play. Each variant points at its own copy of one small
+//! MP3 from the library, tagged with a title that names the variant, so
+//! what plays on the X3 says which variant worked. Everything the probe
 //! writes is named `zz-probe`, and `--clean` removes exactly that.
 
-use std::io::Write;
+use std::io::{Cursor, Seek, Write};
 use std::path::{Path, PathBuf};
 
+use lofty::TextEncoding;
+use lofty::config::WriteOptions;
+use lofty::id3::v2::{Frame, FrameId, Id3v2Tag, TextInformationFrame};
+use lofty::prelude::TagExt;
+use lofty::tag::TagType;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
@@ -18,16 +23,11 @@ use crate::tags::FileKind;
 use crate::{Error, Result};
 
 const DIR: &str = "Music/zz-probe";
-const PLAIN: &str = "Music/zz-probe/01 Probe.mp3";
-const ACCENTS: &str = "Music/zz-probe/02 Élan café.mp3";
-const CJK: &str = "Music/zz-probe/03 日本語の歌.mp3";
-const CASE_LOWER: &str = "Music/zz-probe/04 é.mp3";
-const CASE_UPPER: &str = "Music/zz-probe/04 É.mp3";
 
-/// The folder and file of the long path, over 200 characters in all.
+/// The folder of the long path, over 200 characters with its file.
 fn long_dir() -> String {
     format!(
-        "{DIR}/05 {}",
+        "{DIR}/11 {}",
         "A folder with a long name ".repeat(4).trim_end()
     )
 }
@@ -40,6 +40,18 @@ fn long_file() -> String {
     )
 }
 
+/// One copy of the source on the card.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProbeAudio {
+    /// Relative to the card root.
+    pub path: String,
+    /// The title tag of the copy: what the X3 shows when it plays.
+    pub title: String,
+    /// Its artist tag: `fiio-tunes`, or for variant 10 the accented or CJK
+    /// text the X3 must show.
+    pub artist: String,
+}
+
 /// One probe playlist.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProbePlaylist {
@@ -48,6 +60,12 @@ pub struct ProbePlaylist {
     /// What it tries.
     pub what: &'static str,
     pub text: String,
+    /// The titles of the files its entries point at, in order, once each.
+    pub titles: Vec<String>,
+    /// Entries it holds.
+    pub entries: usize,
+    /// What else to look at on the X3, for the checklist; may be empty.
+    pub hint: &'static str,
 }
 
 /// Everything the probe writes.
@@ -55,8 +73,8 @@ pub struct ProbePlaylist {
 pub struct Plan {
     /// Folders it needs, parents first.
     pub dirs: Vec<String>,
-    /// Copies of the source file, relative to the card root.
-    pub audio: Vec<String>,
+    /// Copies of the source file.
+    pub audio: Vec<ProbeAudio>,
     pub playlists: Vec<ProbePlaylist>,
 }
 
@@ -73,6 +91,7 @@ const PLAIN_FORM: Form = Form {
     crlf: false,
 };
 
+/// `entries` are `(#EXTINF title, location)`.
 fn render(form: &Form, secs: i64, entries: &[(String, String)]) -> String {
     let eol = if form.crlf { "\r\n" } else { "\n" };
     let mut s = String::new();
@@ -85,7 +104,7 @@ fn render(form: &Form, secs: i64, entries: &[(String, String)]) -> String {
     }
     for (title, location) in entries {
         if form.header {
-            s.push_str(&format!("#EXTINF:{secs},fiio-tunes - {title}{eol}"));
+            s.push_str(&format!("#EXTINF:{secs},{title}{eol}"));
         }
         s.push_str(location);
         s.push_str(eol);
@@ -93,134 +112,255 @@ fn render(form: &Form, secs: i64, entries: &[(String, String)]) -> String {
     s
 }
 
+/// One variant: its playlist, how it is written, and its files as
+/// `(label, path under DIR, artist)`, each written once and named by its
+/// label.
+struct Variant {
+    n: u32,
+    playlist: String,
+    what: &'static str,
+    form: Form,
+    files: Vec<(&'static str, String, &'static str)>,
+    /// The location written for a file's path relative to the card root.
+    locate: fn(&str) -> String,
+    /// Above 1, the playlist holds this many entries, each numbered: the
+    /// first file for all but the last, the second file last.
+    repeat: usize,
+    hint: &'static str,
+}
+
+const ARTIST: &str = "fiio-tunes";
+
+fn variants() -> Vec<Variant> {
+    let root = |n: u32| format!("zz-probe-{n:02}.m3u8");
+    let file = |n: u32| format!("{n:02} Probe.mp3");
+    let plain = |s: &str| s.to_owned();
+    let one = |n: u32,
+               playlist: String,
+               what: &'static str,
+               label: &'static str,
+               form: Form,
+               locate: fn(&str) -> String| Variant {
+        n,
+        playlist,
+        what,
+        form,
+        files: vec![(label, file(n), ARTIST)],
+        locate,
+        repeat: 1,
+        hint: "",
+    };
+    vec![
+        one(
+            1,
+            root(1),
+            "card root, Music/... with /, UTF-8, LF, #EXTM3U and #EXTINF",
+            "basic",
+            PLAIN_FORM,
+            plain,
+        ),
+        one(2, root(2), "as 01, with \\", "backslash", PLAIN_FORM, |s| {
+            s.replace('/', "\\")
+        }),
+        one(
+            3,
+            root(3),
+            "as 01, a UTF-8 BOM",
+            "BOM",
+            Form {
+                bom: true,
+                ..PLAIN_FORM
+            },
+            plain,
+        ),
+        one(
+            4,
+            root(4),
+            "as 01, CRLF line endings",
+            "CRLF",
+            Form {
+                crlf: true,
+                ..PLAIN_FORM
+            },
+            plain,
+        ),
+        Variant {
+            hint: "it has no #EXTINF line, so no \"List 05 ...\" text can show",
+            ..one(
+                5,
+                root(5),
+                "as 01, no #EXTM3U and no #EXTINF",
+                "no header",
+                Form {
+                    header: false,
+                    ..PLAIN_FORM
+                },
+                plain,
+            )
+        },
+        one(
+            6,
+            root(6),
+            "as 01, a leading /",
+            "leading slash",
+            PLAIN_FORM,
+            |s| format!("/{s}"),
+        ),
+        one(
+            7,
+            root(7),
+            "as 01, TF1:/Music/...",
+            "TF1",
+            PLAIN_FORM,
+            |s| format!("TF1:/{s}"),
+        ),
+        one(
+            8,
+            format!("Playlists/{}", root(8)),
+            "in Playlists/, ../Music/...",
+            "dot-dot",
+            PLAIN_FORM,
+            |s| format!("../{s}"),
+        ),
+        one(
+            9,
+            format!("Playlists/{}", root(9)),
+            "in Playlists/, Music/... (relative to the card root)",
+            "root-relative",
+            PLAIN_FORM,
+            plain,
+        ),
+        Variant {
+            n: 10,
+            playlist: root(10),
+            what: "as 01, two entries: accents, then CJK",
+            form: PLAIN_FORM,
+            files: vec![
+                ("accents", "10 Élan café.mp3".into(), "Élan café"),
+                ("CJK", "10 日本語の歌.mp3".into(), "日本語の歌"),
+            ],
+            locate: plain,
+            repeat: 1,
+            hint: "play both entries; note whether the artist reads \"Élan café\", then \
+                   \"日本語の歌\" (tags in UTF-16), and whether the file names show right",
+        },
+        Variant {
+            n: 11,
+            playlist: root(11),
+            what: "as 01, a path over 200 characters",
+            form: PLAIN_FORM,
+            files: vec![("long path", long_file()[DIR.len() + 1..].to_owned(), ARTIST)],
+            locate: plain,
+            repeat: 1,
+            hint: "",
+        },
+        Variant {
+            n: 12,
+            playlist: root(12),
+            what: "as 01, 2,000 entries: one file 1,999 times, then another",
+            form: PLAIN_FORM,
+            files: vec![
+                ("2000 entries", file(12), ARTIST),
+                ("last", "12 Last.mp3".into(), ARTIST),
+            ],
+            locate: plain,
+            repeat: 2000,
+            hint: "go to the end of the list: the last entry should be number 2000 \
+                   (\"List 12 #2000\") and play \"Probe 12 last\"; a list that ends \
+                   earlier shows the X3's limit",
+        },
+        one(
+            13,
+            "zz-probe-13.m3u".into(),
+            "as 01, extension .m3u",
+            "m3u",
+            PLAIN_FORM,
+            plain,
+        ),
+        one(
+            14,
+            format!("{DIR}/zz-probe-14.m3u8"),
+            "in Music/zz-probe/, the bare file name",
+            "same folder",
+            PLAIN_FORM,
+            |s| s.rsplit('/').next().unwrap_or(s).to_owned(),
+        ),
+    ]
+}
+
 /// The probe, its `#EXTINF` lines giving `secs`, the source's duration.
 /// Pure.
 pub fn plan(secs: i64) -> Plan {
-    let one = |n: u32, loc: String| vec![(format!("Probe {n:02}"), loc)];
-    let plain = || PLAIN.to_owned();
+    let mut audio = Vec::new();
     let mut playlists = Vec::new();
-    let mut add =
-        |n: u32, dir: &str, what: &'static str, form: &Form, entries: Vec<(String, String)>| {
-            playlists.push(ProbePlaylist {
-                path: format!("{dir}zz-probe-{n:02}.m3u8"),
-                what,
-                text: render(form, secs, &entries),
+    for v in variants() {
+        let mut entries = Vec::new();
+        let mut titles = Vec::new();
+        for (label, name, artist) in &v.files {
+            let path = format!("{DIR}/{name}");
+            let title = format!("Probe {:02} {label}", v.n);
+            entries.push((format!("List {:02} {label}", v.n), (v.locate)(&path)));
+            titles.push(title.clone());
+            audio.push(ProbeAudio {
+                path,
+                title,
+                artist: (*artist).to_owned(),
             });
-        };
-    add(
-        1,
-        "",
-        "card root, Music/... with /, UTF-8, LF, #EXTM3U and #EXTINF",
-        &PLAIN_FORM,
-        one(1, plain()),
-    );
-    add(
-        2,
-        "",
-        "as 01, with \\",
-        &PLAIN_FORM,
-        one(2, PLAIN.replace('/', "\\")),
-    );
-    add(
-        3,
-        "",
-        "as 01, with a UTF-8 BOM",
-        &Form {
-            bom: true,
-            ..PLAIN_FORM
-        },
-        one(3, plain()),
-    );
-    add(
-        4,
-        "",
-        "as 01, CRLF line endings",
-        &Form {
-            crlf: true,
-            ..PLAIN_FORM
-        },
-        one(4, plain()),
-    );
-    add(
-        5,
-        "",
-        "as 01, no #EXTM3U and no #EXTINF",
-        &Form {
-            header: false,
-            ..PLAIN_FORM
-        },
-        one(5, plain()),
-    );
-    add(
-        6,
-        "",
-        "as 01, a leading /",
-        &PLAIN_FORM,
-        one(6, format!("/{PLAIN}")),
-    );
-    add(
-        7,
-        "",
-        "as 01, TF1:/Music/...",
-        &PLAIN_FORM,
-        one(7, format!("TF1:/{PLAIN}")),
-    );
-    add(
-        8,
-        "Playlists/",
-        "in Playlists/, ../Music/...",
-        &PLAIN_FORM,
-        one(8, format!("../{PLAIN}")),
-    );
-    add(
-        9,
-        "Playlists/",
-        "in Playlists/, Music/... (relative to the card root)",
-        &PLAIN_FORM,
-        one(9, plain()),
-    );
-    add(
-        10,
-        "",
-        "as 01, accents, CJK, and é and É (two files, or one if the card merged them)",
-        &PLAIN_FORM,
-        [
-            ("Probe 10 accents", ACCENTS),
-            ("Probe 10 CJK", CJK),
-            ("Probe 10 é", CASE_LOWER),
-            ("Probe 10 É", CASE_UPPER),
-        ]
-        .map(|(t, p)| (t.to_owned(), p.to_owned()))
-        .to_vec(),
-    );
-    add(
-        11,
-        "",
-        "as 01, a path over 200 characters",
-        &PLAIN_FORM,
-        one(11, long_file()),
-    );
-    add(
-        12,
-        "",
-        "as 01, 2,000 entries",
-        &PLAIN_FORM,
-        (1..=2000)
-            .map(|i| (format!("Probe 12 #{i}"), plain()))
-            .collect(),
-    );
+        }
+        if v.repeat > 1 {
+            let (first, last) = (&entries[0].1, &entries[1].1);
+            entries = (1..=v.repeat)
+                .map(|i| {
+                    let at = if i == v.repeat { last } else { first };
+                    (format!("List {:02} #{i:04}", v.n), at.clone())
+                })
+                .collect();
+        }
+        playlists.push(ProbePlaylist {
+            text: render(&v.form, secs, &entries),
+            path: v.playlist,
+            what: v.what,
+            titles,
+            entries: entries.len(),
+            hint: v.hint,
+        });
+    }
     Plan {
         dirs: vec!["Music".into(), DIR.into(), long_dir(), "Playlists".into()],
-        audio: vec![
-            PLAIN.into(),
-            ACCENTS.into(),
-            CJK.into(),
-            CASE_LOWER.into(),
-            CASE_UPPER.into(),
-            long_file(),
-        ],
+        audio,
         playlists,
     }
+}
+
+/// What the owner checks on the X3, one block per playlist. Pure.
+pub fn checklist(plan: &Plan) -> String {
+    let mut s = String::from(
+        "First run `fiio-tunes eject` and unplug the X3. On the X3, open Browse \
+         Files (not the categories) and, for each playlist below, note:\n  \
+         A. is it listed, in the folder its line names?\n  \
+         B. opened, how many entries does it show, and with which text?\n  \
+         C. does each entry play, and which title is on the screen: \"Probe NN ...\" \
+         (the file's tag), \"List NN ...\" (the playlist's line) or the file name?\n\
+         Then plug the X3 in and run `fiio-tunes probe --clean`.\n",
+    );
+    for p in &plan.playlists {
+        s.push_str(&format!(
+            "\n{}\n  tries: {}\n  should show {} {}, and play {}\n",
+            p.path,
+            p.what,
+            p.entries,
+            if p.entries == 1 { "entry" } else { "entries" },
+            p.titles
+                .iter()
+                .map(|t| format!("\"{t}\""))
+                .collect::<Vec<_>>()
+                .join(" then ")
+        ));
+        if !p.hint.is_empty() {
+            s.push_str(&format!("  also: {}\n", p.hint));
+        }
+    }
+    s
 }
 
 /// The library file the probe copies: a present MP3 whose tags were read,
@@ -244,6 +384,45 @@ pub fn source(conn: &Connection) -> Result<TrackRow> {
         .ok_or(Error::NoProbeSource)
 }
 
+/// An ID3v2.3 text frame: Latin-1 when `text` is ASCII, so a player that
+/// reads no UTF-16 still shows it; UTF-16 otherwise.
+fn text_frame(id: &'static str, text: &str) -> Frame<'static> {
+    let encoding = match text.is_ascii() {
+        true => TextEncoding::Latin1,
+        false => TextEncoding::UTF16,
+    };
+    Frame::Text(TextInformationFrame::new(
+        FrameId::Valid(id.into()),
+        encoding,
+        text.to_owned(),
+    ))
+}
+
+/// `source`, an MP3, with every tag it had replaced by one ID3v2.3 tag:
+/// `title`, `artist` and the album `zz-probe`. Works on the bytes in
+/// memory.
+pub fn tagged(source: &[u8], title: &str, artist: &str) -> std::result::Result<Vec<u8>, String> {
+    let opts = WriteOptions::new().use_id3v23(true);
+    let mut file = Cursor::new(source.to_vec());
+    for t in [TagType::Id3v2, TagType::Ape] {
+        file.rewind().map_err(|e| e.to_string())?;
+        t.remove_from(&mut file, opts).map_err(|e| e.to_string())?;
+    }
+    // By hand: lofty's ID3v1 removal appends an empty tag to a file that
+    // has none.
+    let len = file.get_ref().len();
+    if len >= 128 && file.get_ref()[len - 128..].starts_with(b"TAG") {
+        file.get_mut().truncate(len - 128);
+    }
+    let mut tag = Id3v2Tag::new();
+    tag.insert(text_frame("TIT2", title));
+    tag.insert(text_frame("TPE1", artist));
+    tag.insert(text_frame("TALB", "zz-probe"));
+    file.rewind().map_err(|e| e.to_string())?;
+    tag.save_to(&mut file, opts).map_err(|e| e.to_string())?;
+    Ok(file.into_inner())
+}
+
 /// What the probe left on the card, in the data folder, so `--clean` can
 /// remove the folders it created and no other.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -251,6 +430,12 @@ struct Record {
     card: PathBuf,
     /// Folders the probe created, parents first.
     created: Vec<String>,
+}
+
+/// Where the checklist of the probe `record` remembers is saved, next to
+/// it; `clean` deletes it with the record.
+pub fn checklist_path(record: &Path) -> PathBuf {
+    record.with_file_name("probe-checklist.txt")
 }
 
 fn load_record(path: &Path) -> Option<Record> {
@@ -261,8 +446,6 @@ fn load_record(path: &Path) -> Option<Record> {
 pub struct Written {
     pub files: usize,
     pub bytes: u64,
-    /// Whether the card holds `04 é.mp3` and `04 É.mp3` as two files.
-    pub case_pair_kept: bool,
 }
 
 fn exists(p: &Path) -> bool {
@@ -275,6 +458,7 @@ pub fn already_there(card: &Path) -> bool {
     let mut targets = plan
         .audio
         .iter()
+        .map(|a| &a.path)
         .chain(plan.playlists.iter().map(|p| &p.path));
     targets.any(|t| exists(&card.join(t)))
 }
@@ -293,15 +477,24 @@ pub fn check(card: &Path, record: &Path) -> Result<()> {
     }
 }
 
-/// Writes the probe to the card at `card`: the copies of `source`, each
-/// read back and compared, then the playlists. `record` is the file in
+/// Writes the probe to the card at `card`: the tagged copies of `source`,
+/// each read back and compared, then the playlists. `record` is the file in
 /// the data folder that remembers the folders created. Refused when a
 /// probe file is already there.
 pub fn write(card: &Path, source: &Path, secs: i64, record: &Path) -> Result<Written> {
     check(card, record)?;
     let plan = plan(secs);
     let bytes = std::fs::read(source).at(source)?;
-    let hash = blake3::hash(&bytes);
+    // Every copy is tagged before anything is written: a source lofty
+    // cannot rewrite leaves the card as it was.
+    let copies = plan
+        .audio
+        .iter()
+        .map(|a| {
+            tagged(&bytes, &a.title, &a.artist)
+                .map_err(|why| Error::ProbeSourceTags(source.to_owned(), why))
+        })
+        .collect::<Result<Vec<_>>>()?;
     // Recorded before anything is created, so a probe cut short can still
     // be cleaned.
     let mut rec = load_record(record)
@@ -326,47 +519,26 @@ pub fn write(card: &Path, source: &Path, secs: i64, record: &Path) -> Result<Wri
         std::fs::create_dir(&p).at(&p)?;
     }
 
-    let mut out = Written {
-        files: 0,
-        bytes: 0,
-        case_pair_kept: false,
-    };
-    for rel in &plan.audio {
-        let p = card.join(rel);
-        let mut f = match std::fs::OpenOptions::new()
+    let mut out = Written { files: 0, bytes: 0 };
+    for (a, copy) in plan.audio.iter().zip(&copies) {
+        let p = card.join(&a.path);
+        let mut f = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&p)
-        {
-            // FAT took `04 É` for `04 é`, written just before.
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && rel == CASE_UPPER => {
-                continue;
-            }
-            r => r.at(&p)?,
-        };
-        f.write_all(&bytes).at(&p)?;
+            .at(&p)?;
+        f.write_all(copy).at(&p)?;
         f.sync_all().at(&p)?;
         drop(f);
-        if crate::card::read_back(&p).at(&p)? != *hash.as_bytes() {
+        if crate::card::read_back(&p).at(&p)? != *blake3::hash(copy).as_bytes() {
             return Err(Error::VerifyFailed(format!(
-                "{} reads back different from {}",
-                p.display(),
-                source.display()
+                "{} reads back different from what was written",
+                p.display()
             )));
         }
         out.files += 1;
-        out.bytes += bytes.len() as u64;
+        out.bytes += copy.len() as u64;
     }
-    let dir = card.join(DIR);
-    let names: Vec<String> = std::fs::read_dir(&dir)
-        .at(&dir)?
-        .filter_map(|e| e.ok()?.file_name().into_string().ok())
-        .collect();
-    let file_name = |p: &str| p.rsplit('/').next().unwrap_or(p).to_owned();
-    out.case_pair_kept = [CASE_LOWER, CASE_UPPER]
-        .iter()
-        .all(|p| names.contains(&file_name(p)));
-
     for pl in &plan.playlists {
         let p = card.join(&pl.path);
         write_atomic(&p, &pl.text, WriteMode::CreateNew)?;
@@ -394,6 +566,7 @@ pub fn clean(card: &Path, record: &Path) -> Result<Cleaned> {
     let files = plan
         .audio
         .iter()
+        .map(|a| &a.path)
         .chain(plan.playlists.iter().map(|p| &p.path));
     for rel in files {
         let p = card.join(rel);
@@ -411,7 +584,7 @@ pub fn clean(card: &Path, record: &Path) -> Result<Cleaned> {
     // Temp files of a playlist write cut short, in the folders the probe
     // writes playlists to. No other fiio-tunes writes while the lock is
     // held.
-    for d in ["", "Playlists"] {
+    for d in ["", "Playlists", DIR] {
         let Ok(entries) = std::fs::read_dir(card.join(d)) else {
             continue;
         };
@@ -427,6 +600,9 @@ pub fn clean(card: &Path, record: &Path) -> Result<Cleaned> {
     // A record of another card is left for that card.
     let rec = load_record(record);
     let ours = rec.as_ref().is_none_or(|r| r.card == card);
+    // The checklist only with a record of this card: without one, it may be
+    // that of a probe elsewhere whose record was lost.
+    let mine = rec.as_ref().is_some_and(|r| r.card == card);
     let created = rec
         .filter(|r| r.card == card)
         .map(|r| r.created)
@@ -448,9 +624,16 @@ pub fn clean(card: &Path, record: &Path) -> Result<Cleaned> {
             Err(e) => return Err(e).at(&p),
         }
     }
+    let mut gone = Vec::new();
     if ours {
-        match std::fs::remove_file(record) {
-            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e).at(record),
+        gone.push(record.to_owned());
+    }
+    if mine {
+        gone.push(checklist_path(record));
+    }
+    for f in gone {
+        match std::fs::remove_file(&f) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e).at(f),
             _ => {}
         }
     }
@@ -467,94 +650,44 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_plan_has_the_twelve_variants_of_the_spec() {
+    fn the_plan_has_the_fourteen_variants_of_the_spec() {
         let p = plan(213);
-        assert_eq!(p.playlists.len(), 12);
+        assert_eq!(p.playlists.len(), 14);
         let v = |n: usize| &p.playlists[n - 1];
         assert_eq!(v(1).path, "zz-probe-01.m3u8");
         assert_eq!(
             v(1).text,
-            "#EXTM3U\n#EXTINF:213,fiio-tunes - Probe 01\nMusic/zz-probe/01 Probe.mp3\n"
+            "#EXTM3U\n#EXTINF:213,List 01 basic\nMusic/zz-probe/01 Probe.mp3\n"
         );
-        assert!(v(2).text.contains("Music\\zz-probe\\01 Probe.mp3\n"));
+        assert_eq!(v(1).titles, ["Probe 01 basic"]);
+        assert!(v(2).text.contains("\nMusic\\zz-probe\\02 Probe.mp3\n"));
         assert!(v(3).text.starts_with("\u{feff}#EXTM3U\n"));
-        assert!(v(4).text.ends_with("01 Probe.mp3\r\n") && !v(4).text.contains("3U\n"));
-        assert_eq!(v(5).text, "Music/zz-probe/01 Probe.mp3\n");
-        assert!(v(6).text.contains("\n/Music/zz-probe/01 Probe.mp3\n"));
-        assert!(v(7).text.contains("\nTF1:/Music/zz-probe/01 Probe.mp3\n"));
+        assert!(v(4).text.ends_with("04 Probe.mp3\r\n") && !v(4).text.contains("3U\n"));
+        assert_eq!(v(5).text, "Music/zz-probe/05 Probe.mp3\n");
+        assert!(v(6).text.contains("\n/Music/zz-probe/06 Probe.mp3\n"));
+        assert!(v(7).text.contains("\nTF1:/Music/zz-probe/07 Probe.mp3\n"));
         assert_eq!(v(8).path, "Playlists/zz-probe-08.m3u8");
-        assert!(v(8).text.contains("\n../Music/zz-probe/01 Probe.mp3\n"));
+        assert!(v(8).text.contains("\n../Music/zz-probe/08 Probe.mp3\n"));
         assert_eq!(v(9).path, "Playlists/zz-probe-09.m3u8");
-        assert_eq!(
-            v(10).text.lines().filter(|l| !l.starts_with('#')).count(),
-            4
-        );
+        assert_eq!(v(10).titles, ["Probe 10 accents", "Probe 10 CJK"]);
         let long = v(11).text.lines().last().unwrap();
         assert!(long.chars().count() > 200, "{}", long.chars().count());
         assert!(long.split('/').all(|c| c.encode_utf16().count() <= 255));
-        assert_eq!(
-            v(12).text.lines().filter(|l| !l.starts_with('#')).count(),
-            2000
+        assert_eq!(v(12).entries, 2000);
+        assert!(
+            v(12)
+                .text
+                .ends_with("#EXTINF:213,List 12 #2000\nMusic/zz-probe/12 Last.mp3\n")
         );
-        // Every location points at a file the probe writes.
-        for pl in &p.playlists[..] {
-            let lines = pl.text.lines().map(|l| l.trim_start_matches('\u{feff}'));
-            for l in lines.filter(|l| !l.starts_with('#')) {
-                let l = l
-                    .trim_start_matches("TF1:")
-                    .trim_start_matches("../")
-                    .trim_start_matches('/')
-                    .replace('\\', "/");
-                assert!(p.audio.contains(&l), "{} points at {l}", pl.path);
-            }
-        }
-    }
-
-    #[test]
-    fn write_then_clean_leaves_the_card_as_it_was() {
-        let card = tempfile::tempdir().unwrap();
-        let data = tempfile::tempdir().unwrap();
-        let record = data.path().join("probe.toml");
-        std::fs::create_dir(card.path().join("Music")).unwrap();
-        std::fs::write(card.path().join("Music/mine.mp3"), b"keep").unwrap();
-        let src = data.path().join("src.mp3");
-        std::fs::write(&src, b"ID3 audio").unwrap();
-
-        let w = write(card.path(), &src, 200, &record).unwrap();
-        assert_eq!(w.files, 6 + 12);
-        assert!(w.case_pair_kept, "ext4 and tmpfs keep both");
-        assert_eq!(std::fs::read(card.path().join(CJK)).unwrap(), b"ID3 audio");
-        assert!(matches!(
-            write(card.path(), &src, 200, &record),
-            Err(Error::ProbeThere(_))
-        ));
-
-        let c = clean(card.path(), &record).unwrap();
-        assert_eq!(c.files, 18);
-        // "Music" was there before: kept; "Playlists" was made: removed.
-        assert!(c.dirs.contains(&"Playlists".to_owned()));
-        assert!(!c.dirs.contains(&"Music".to_owned()));
-        let mut left: Vec<_> = walkdir::WalkDir::new(card.path())
-            .into_iter()
-            .map(|e| {
-                e.unwrap()
-                    .path()
-                    .strip_prefix(card.path())
-                    .unwrap()
-                    .to_owned()
-            })
-            .collect();
-        left.sort();
-        assert_eq!(
-            left,
-            [
-                Path::new(""),
-                Path::new("Music"),
-                Path::new("Music/mine.mp3")
-            ]
-        );
-        assert!(!record.exists());
-        // Cleaning again finds nothing to do.
-        assert_eq!(clean(card.path(), &record).unwrap(), Cleaned::default());
+        assert_eq!(v(12).titles, ["Probe 12 2000 entries", "Probe 12 last"]);
+        assert_eq!(v(13).path, "zz-probe-13.m3u");
+        assert_eq!(v(14).path, "Music/zz-probe/zz-probe-14.m3u8");
+        assert!(v(14).text.ends_with("\n14 Probe.mp3\n"));
+        // One file per entry label, each title used once.
+        let mut titles: Vec<&str> = p.audio.iter().map(|a| a.title.as_str()).collect();
+        assert_eq!(titles.len(), 16);
+        titles.sort();
+        titles.dedup();
+        assert_eq!(titles.len(), 16);
     }
 }

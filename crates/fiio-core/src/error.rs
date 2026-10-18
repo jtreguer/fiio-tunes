@@ -116,6 +116,8 @@ pub enum Error {
     Eject(String),
     #[error("the library index has no MP3 file to copy for the probe")]
     NoProbeSource,
+    #[error("{}: the probe cannot tag a copy of it ({}); nothing written", .0.display(), .1)]
+    ProbeSourceTags(PathBuf, String),
     #[error("position {position} is out of range (playlist has {len} entries)")]
     BadPosition { position: usize, len: usize },
 }

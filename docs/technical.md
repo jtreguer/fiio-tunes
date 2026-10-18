@@ -97,8 +97,10 @@ then:
 `card_key` (`paths::card_key`) stands for the form FAT32 compares names in:
 NFC, then each character upper-cased when its upper case is one character,
 which is what FAT's upcase table does for ordinary letters. The kernel's own
-table may differ for rare characters (the dotless `ı`); the probe (9.4)
-checks a pair of accented names on the real card. SQLite's `NOCASE` folds ASCII only, so it is not used.
+table may differ for rare characters (the dotless `ı`), and Linux's vfat as
+mounted here folds ASCII only, so it would write `é` and `É` side by side;
+folding them in `card_key` keeps a sync from writing such a pair (9.4).
+SQLite's `NOCASE` folds ASCII only, so it is not used.
 
 No statistics tables.
 
@@ -183,44 +185,71 @@ extension, in library path order. Pure and deterministic.
 ### 9.4 Playlist format: the probe
 
 FiiO documents only that the X3 2nd gen reads `.m3u8` files at the card root
-with relative paths and no drive letter, from Browse Files. The rest is
-settled on the device, once, before the first playlist is written:
-`fiio-tunes probe` (run only when the owner says so, with the X3 at hand)
-writes `zz-probe-NN.m3u8` files in these variants. The files they point at
-are copies of one library MP3 (present, of one to ten minutes, the
-smallest), written to `Music/zz-probe/` under the names the variants need
-(`01 Probe.mp3`, accents, CJK, `04 é.mp3` and `04 É.mp3`, a path over 200
-characters), each read back and compared. The probe refuses to start when
-any of its files is already there, and remembers in
-`~/.local/share/fiio-tunes/probe.toml` the folders it created (`Music`,
-`Playlists`) so that `--clean` removes those only if they are empty, and
-`Music/zz-probe` always. One probe at a time: a probe of another card that
-still holds its files is refused; a record whose card no longer holds them
-(cleaned by hand, or the card mounted elsewhere now) is replaced, and with
-it the list of folders the probe made there: an empty `Music` or `Playlists`
-it left on that card stays. `--clean` also removes temp files a playlist write
-cut short left in the two folders it writes playlists to:
+with relative paths and no drive letter, from Browse Files (external
+playlists are not shown under the categories). The rest is settled on the
+device, once, before the first playlist is written: `fiio-tunes probe` (run
+only when the owner says so, with the X3 at hand) writes `zz-probe-NN`
+playlists in the variants below.
 
-| # | Variant |
-|---|---|
-| 1 | root, `Music/...` with `/`, UTF-8, LF, `#EXTM3U` and `#EXTINF` |
-| 2 | as 1, with `\` |
-| 3 | as 1, with a UTF-8 BOM |
-| 4 | as 1, CRLF |
-| 5 | as 1, no `#EXTM3U` and no `#EXTINF` |
-| 6 | as 1, a leading `/` |
-| 7 | as 1, `TF1:/Music/...` |
-| 8 | in `Playlists/`, `../Music/...` |
-| 9 | in `Playlists/`, `Music/...` (relative to the root) |
-| 10 | as 1, a path with accents and one with CJK characters; also two files whose names differ only by the case of an accented letter, to see whether the card keeps both |
-| 11 | as 1, a path over 200 characters |
-| 12 | as 1, 2,000 entries |
+Each variant points at its own file, so what plays on the X3 tells which
+variant worked. The files are copies of one library MP3 (present, of one to
+ten minutes, the smallest), each with its tags replaced by one ID3v2.3 tag:
+title `Probe NN <what>` (the "on the X3" column), artist `fiio-tunes`,
+album `zz-probe`. ASCII text is written in Latin-1, so a player that reads
+no UTF-16 still shows the title; the artists of variant 10, `Élan café` and
+`日本語の歌`, are in UTF-16 and test how the X3 shows tags in other
+scripts. Only the copy on the card is tagged; the library file is read,
+never written. Every copy is read back and compared with the bytes
+meant for it. Each `#EXTINF` line names the entry `List NN <what>`, so the
+screen also tells whether the X3 shows the playlist's title or the file's.
 
-The owner reports which play. `fiio-tunes probe --clean` removes them. The
-result fixes `[card] playlists_dir`, the separator, the BOM and the line
-endings, and is recorded here. Until then the defaults are variant 1.
+| # | Playlist | Variant | File (under `Music/zz-probe/`) | On the X3 |
+|---|---|---|---|---|
+| 1 | `zz-probe-01.m3u8` | root, `Music/...` with `/`, UTF-8, LF, `#EXTM3U` and `#EXTINF` | `01 Probe.mp3` | basic |
+| 2 | `zz-probe-02.m3u8` | as 1, with `\` | `02 Probe.mp3` | backslash |
+| 3 | `zz-probe-03.m3u8` | as 1, a UTF-8 BOM | `03 Probe.mp3` | BOM |
+| 4 | `zz-probe-04.m3u8` | as 1, CRLF | `04 Probe.mp3` | CRLF |
+| 5 | `zz-probe-05.m3u8` | as 1, no `#EXTM3U` and no `#EXTINF` | `05 Probe.mp3` | no header |
+| 6 | `zz-probe-06.m3u8` | as 1, a leading `/` | `06 Probe.mp3` | leading slash |
+| 7 | `zz-probe-07.m3u8` | as 1, `TF1:/Music/...` | `07 Probe.mp3` | TF1 |
+| 8 | `Playlists/zz-probe-08.m3u8` | `../Music/...` | `08 Probe.mp3` | dot-dot |
+| 9 | `Playlists/zz-probe-09.m3u8` | `Music/...`, relative to the root | `09 Probe.mp3` | root-relative |
+| 10 | `zz-probe-10.m3u8` | as 1, two entries: accents, then CJK, in the file names and the artists | `10 Élan café.mp3`, `10 日本語の歌.mp3` | accents, CJK |
+| 11 | `zz-probe-11.m3u8` | as 1, a path over 200 characters | `11 A folder…/A file….mp3` | long path |
+| 12 | `zz-probe-12.m3u8` | as 1, 2,000 entries numbered `List 12 #0001` to `#2000`: one file 1,999 times, then another | `12 Probe.mp3`, `12 Last.mp3` | 2000 entries, last |
+| 13 | `zz-probe-13.m3u` | as 1, extension `.m3u` | `13 Probe.mp3` | m3u |
+| 14 | `Music/zz-probe/zz-probe-14.m3u8` | next to its file, the bare file name | `14 Probe.mp3` | same folder |
 
-Results: not run yet.
+There is no pair of names differing only by the case of an accented letter:
+Linux's vfat (`iocharset=ascii`, `utf8`) folds ASCII only and writes both,
+which FAT and Windows take for one name, so the card would hold a
+duplicate and the test would say nothing about the X3. `card_key` folds
+them (section 6), so a sync never writes such a pair.
+
+The probe refuses to start when any of its files is already there, and
+remembers in `~/.local/share/fiio-tunes/probe.toml` the folders it created
+(`Music`, `Playlists`) so that `--clean` removes those only if they are
+empty, and `Music/zz-probe` always. One probe at a time: a probe of another
+card that still holds its files is refused; a record whose card no longer
+holds them (cleaned by hand, or the card mounted elsewhere now) is
+replaced, and with it the list of folders the probe made there: an empty
+`Music` or `Playlists` it left on that card stays. `--clean` also removes
+temp files a playlist write cut short left in the folders it writes
+playlists to.
+
+After writing, the probe prints what to do: eject (`fiio-tunes eject`),
+then on the X3, in Browse Files, for each playlist note whether it is
+listed, how many entries it shows and with which text, and whether each
+entry plays, with the title shown; for 5, 10 and 12 it says what else to
+look at (no `List` text possible, the artists, the last entry). The same checklist is saved to
+`~/.local/share/fiio-tunes/probe-checklist.txt`, which `--clean` deletes with the record (not when the record is of another card). `fiio-tunes probe
+--clean` removes the probe. The result fixes `[card] playlists_dir`, the
+separator, the BOM, the line endings and the extension, and is recorded
+here. Until then the defaults are variant 1.
+
+Results: the first probe (one file for every variant) ran on 2026-10-18 and
+told nothing; the owner could not tell which entries played. The second
+has not run yet.
 
 ### 9.5 Card playlists
 
