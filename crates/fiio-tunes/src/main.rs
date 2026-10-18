@@ -1152,6 +1152,21 @@ fn run_sync(args: SyncArgs) -> Result<Outcome> {
     if tty {
         let _ = writeln!(io::stderr());
     }
+    let result = result.map_err(|failed| {
+        let hint = match &failed.backup {
+            Some(b) => format!(
+                "the card was backed up as {} before writing; run `fiio-tunes restore {}` \
+                 before syncing again: it puts its playlists and record back",
+                b.stamp, b.stamp
+            ),
+            None => "nothing was written to the card".into(),
+        };
+        anyhow::Error::new(failed.error).context(hint)
+    });
+    fiio_core::notify::send(&match &result {
+        Ok(done) => fiio_core::notify::synced(done),
+        Err(e) => fiio_core::notify::failed(&format!("{e:#}")),
+    });
     match result {
         Ok(done) => {
             // Errors ignored: the card is written; a terminal gone must not
@@ -1198,17 +1213,7 @@ fn run_sync(args: SyncArgs) -> Result<Outcome> {
             }
             Ok(Outcome::Done)
         }
-        Err(failed) => {
-            let hint = match &failed.backup {
-                Some(b) => format!(
-                    "the card was backed up as {} before writing; run `fiio-tunes restore {}` \
-                     before syncing again: it puts its playlists and record back",
-                    b.stamp, b.stamp
-                ),
-                None => "nothing was written to the card".into(),
-            };
-            Err(anyhow::Error::new(failed.error).context(hint))
-        }
+        Err(e) => Err(e),
     }
 }
 

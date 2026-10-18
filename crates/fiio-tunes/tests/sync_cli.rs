@@ -95,6 +95,8 @@ impl Sandbox {
             .env("XDG_CONFIG_HOME", self.base().join("config"))
             .env("XDG_DATA_HOME", self.base().join("data"))
             .env("FIIO_TUNES_NO_DETECT", "1")
+            // A fake notify-send first: no test sync shows a real notification.
+            .env("PATH", common::fake_notify_send_path(&self.base()))
             .args(args)
             .stdin(Stdio::null())
             .output()

@@ -638,7 +638,32 @@ Decisions taken in F7:
 - Eject: `device::eject` unmounts and powers off through `udisksctl`, and
   refuses anything but the block device of a FiiO player. The CLI gains
   `fiio-tunes eject` (section 13), which it lacked.
-- Notifications come with F8.
+- Notifications come with F8 (section 14.1).
+
+### 14.1 Packaging and notifications (F8)
+
+- `packaging/install.sh` runs `cargo install --locked` for
+  `crates/fiio-tunes` and `crates/fiio-tunes-gui` (into
+  `$CARGO_INSTALL_ROOT`, by default `~/.cargo`) and writes the desktop entry
+  `~/.local/share/applications/fiio-tunes.desktop` from
+  `packaging/fiio-tunes.desktop`, with `Exec` set to the installed
+  `fiio-tunes-gui` in full. `StartupWMClass` is the application id,
+  `dev.fiiotunes.FiioTunes`. `install.sh --uninstall` removes the binaries
+  and the entry. The script is iprune's with the names changed.
+- Notifications through `notify-send` (module `notify`), as in iprune, once
+  a plan is confirmed (`--yes`, the prompt, or Apply in the window):
+  "X3 synced" with what changed, "X3 sync stopped early" with why, or "X3
+  sync failed" with the error, shown until dismissed. The failure's text
+  starts with the backup to restore, when there is one, then the error, cut
+  at 300 characters. A failure after the confirmation notifies even when it
+  came before any write, such as a plan that changed since the window
+  showed it. The CLI and the window use the same wording. `notify-send` is
+  started without waiting for it, and a notification that cannot be shown
+  is ignored. A plan that is only shown, declined or found empty gives none,
+  and plugging in the X3 gives none either.
+- Optional binding, for example in `~/.config/hypr/bindings.conf`:
+  `bindd = SUPER SHIFT, X, FiiO X3, exec, fiio-tunes-gui`. Pressing it
+  again brings the open window to the front.
 
 ## 15. Testing
 

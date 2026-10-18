@@ -102,7 +102,9 @@ impl Sandbox {
         cmd.env("HOME", self.base().join("home"))
             .env("XDG_CONFIG_HOME", self.base().join("config"))
             .env("XDG_DATA_HOME", self.base().join("data"))
-            .env("FIIO_TUNES_NO_DETECT", "1");
+            .env("FIIO_TUNES_NO_DETECT", "1")
+            // A fake notify-send first: no test sync shows a real notification.
+            .env("PATH", common::fake_notify_send_path(&self.base()));
         cmd
     }
 
@@ -913,4 +915,110 @@ fn sync_drops_a_mapping_whose_file_is_gone_instead_of_saying_up_to_date() {
     let o = sb.run(&["sync", "--yes"]);
     assert_ok(&o);
     assert!(out(&o).contains("up to date"), "{}", out(&o));
+}
+
+// ------------------------------------------------- F8: desktop notifications
+
+impl Sandbox {
+    /// What the fake `notify-send` was given (see `common::notifications`).
+    fn notifications(&self, want: usize) -> Vec<String> {
+        common::notifications(&self.base(), want)
+    }
+}
+
+// Prevents: a sync that wrote the card ending in silence (the owner walked
+// away), or a second sync with nothing to do announcing a change: the first
+// sends one normal notification naming the playlist change, the second none.
+#[test]
+fn a_sync_that_applies_sends_one_normal_notification_and_an_empty_one_sends_none() {
+    let sb = Sandbox::adopted(2);
+    sb.playlist("Rock", &[1]);
+    assert_ok(&sb.run(&["sync", "--yes"]));
+    let lines = sb.notifications(1);
+    assert_eq!(lines.iter().filter(|l| *l == "--").count(), 1, "{lines:?}");
+    assert!(lines.contains(&"--urgency=normal".to_owned()), "{lines:?}");
+    let text = common::notification_text(&lines);
+    assert_eq!(text.len(), 2, "one summary and one body: {lines:?}");
+    assert_eq!(text[0], "X3 synced");
+    assert!(text[1].contains("1 playlist change"), "{}", text[1]);
+
+    let again = sb.run(&["sync", "--yes"]);
+    assert_ok(&again);
+    assert!(out(&again).contains("up to date"), "{}", out(&again));
+    assert_eq!(sb.notifications(0), lines, "no new notification");
+}
+
+// Prevents: the notification not counting what a full sync copied: the body
+// says how many tracks went to the card.
+#[test]
+fn a_full_sync_notification_counts_the_copied_tracks() {
+    let sb = Sandbox::new(3);
+    assert_ok(&sb.run(&["adopt"]));
+    assert_ok(&sb.run(&["sync", "--yes"]));
+    let lines = sb.notifications(1);
+    let text = common::notification_text(&lines);
+    assert_eq!(text[0], "X3 synced", "{lines:?}");
+    assert!(text[1].contains("opied 3 tracks"), "{}", text[1]);
+}
+
+// Prevents: a notification for a run that wrote nothing: --plan-only, a
+// refused plan (no terminal, no --yes) and a card another fiio-tunes holds
+// all send none. (A plan declined at the prompt needs a terminal, where the
+// notifier can be hung up before it logs: not testable here.)
+#[test]
+fn plan_only_a_refused_plan_and_a_busy_card_send_no_notification() {
+    let sb = Sandbox::adopted(2);
+    sb.playlist("Rock", &[1]);
+    assert_ok(&sb.run(&["sync", "--plan-only"]));
+    assert_code(&sb.run(&["sync"]), 1);
+    let paths = fiio_core::config::Paths {
+        config_file: sb.config_file(),
+        data_dir: sb.data_dir(),
+    };
+    let held = fiio_core::lock::card(&paths).unwrap();
+    assert_code(&sb.run(&["sync", "--yes"]), 1);
+    drop(held);
+    assert_eq!(sb.notifications(0), Vec::<String>::new());
+    assert!(!sb.base().join("notify.log").exists());
+    // The notifier works: the same sync, confirmed, does send.
+    assert_ok(&sb.run(&["sync", "--yes"]));
+    assert!(!sb.notifications(1).is_empty());
+}
+
+// Prevents: a sync that failed after the card was backed up ending in
+// silence or in a plain notification: it sends a critical one that leads
+// with the backup to restore. The card folder is made read-only after the
+// plan is made, so the write fails.
+#[test]
+fn a_sync_that_fails_while_applying_sends_a_critical_notification() {
+    use std::os::unix::fs::PermissionsExt;
+    let sb = Sandbox::adopted(1);
+    sb.playlist("Rock", &[1]);
+    let set = |mode| fs::set_permissions(&sb.card.root, fs::Permissions::from_mode(mode)).unwrap();
+    set(0o555);
+    if fs::File::create(sb.card.root.join(".probe")).is_ok() {
+        set(0o755);
+        eprintln!("skipped: permission bits do not stop writing here (root?)");
+        return;
+    }
+    let o = sb.run(&["sync", "--yes"]);
+    set(0o755);
+    assert_code(&o, 1);
+    let backups = sb.backups();
+    assert_eq!(backups.len(), 1, "{}", err(&o));
+    let lines = sb.notifications(1);
+    assert!(
+        lines.contains(&"--urgency=critical".to_owned()),
+        "{lines:?}"
+    );
+    let text = common::notification_text(&lines);
+    assert_eq!(text.len(), 2, "{lines:?}");
+    assert_eq!(text[0], "X3 sync failed");
+    assert!(
+        text[1].contains(&backups[0]),
+        "the backup comes first: {}",
+        text[1]
+    );
+    assert!(!sb.card.root.join("Rock.m3u8").exists());
+    assert_eq!(sb.card_id(), None);
 }

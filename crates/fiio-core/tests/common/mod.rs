@@ -508,3 +508,65 @@ impl FakeCard {
         self.age();
     }
 }
+
+/// Ends each notification in the fake `notify-send`'s log.
+const END: &str = ".end-of-notification";
+
+/// A `bin` folder in `base` holding a `notify-send` that appends one
+/// argument per line to `base/notify.log`, then [`END`]. Returns the PATH
+/// that puts it first and keeps the rest (ffmpeg, `script`): a CLI test that
+/// can run an applying sync sets it, or the sync pops a real desktop
+/// notification.
+pub fn fake_notify_send_path(base: &Path) -> String {
+    use std::os::unix::fs::PermissionsExt;
+    let bin = base.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    let tool = bin.join("notify-send");
+    // Written once: rewriting a script other threads may be about to run
+    // can fail with "Text file busy".
+    if !tool.exists() {
+        fs::write(
+            &tool,
+            format!(
+                "#!/bin/sh\n{{ for a in \"$@\"; do printf '%s\\n' \"$a\"; done; echo {END}; }} >> '{}'\n",
+                base.join("notify.log").display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    )
+}
+
+/// What the fake `notify-send` was given, one argument per line, for
+/// `want` whole notifications. The CLI does not wait for it, so this polls
+/// until `want` have ended; with 0 it waits a while to catch one that comes
+/// late.
+pub fn notifications(base: &Path, want: usize) -> Vec<String> {
+    let log = base.join("notify.log");
+    let mut text = String::new();
+    for _ in 0..if want == 0 { 40 } else { 200 } {
+        text = fs::read_to_string(&log).unwrap_or_default();
+        if want > 0 && text.lines().filter(|l| *l == END).count() >= want {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    text.lines()
+        .filter(|l| *l != END)
+        .map(str::to_owned)
+        .collect()
+}
+
+/// The arguments of a notification: the summary and the body after `--`.
+pub fn notification_text(lines: &[String]) -> &[String] {
+    let dash = lines
+        .iter()
+        .position(|l| l == "--")
+        .expect("-- before text");
+    &lines[dash + 1..]
+}

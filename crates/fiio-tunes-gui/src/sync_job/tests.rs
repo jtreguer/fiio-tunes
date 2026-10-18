@@ -487,3 +487,50 @@ fn a_failure_after_the_backup_names_the_backup_and_keeps_the_cause() {
         "no track was copied"
     );
 }
+
+// Prevents: the window staying silent after an applied sync (the user may
+// have walked away), or announcing one when the plan was empty: an applied
+// plan carries a normal "synced" note with its counts, an empty one none.
+#[test]
+fn apply_returns_a_note_when_it_applied_and_none_for_an_empty_plan() {
+    let w = adopted(3);
+    let planned = plan(&w.cfg(), &w.paths).unwrap();
+    let done = apply_all(&w, &planned.plan).unwrap();
+    let note = done.note.expect("a sync that copied has a note");
+    assert_eq!(note.summary, "X3 synced");
+    assert!(!note.urgent);
+    assert!(note.body.contains("3 tracks"), "{}", note.body);
+
+    let again = plan(&w.cfg(), &w.paths).unwrap();
+    assert!(again.plan.is_empty());
+    let done = apply_all(&w, &again.plan).unwrap();
+    assert_eq!(done.stamp, None);
+    assert_eq!(done.note, None);
+}
+
+// Prevents: a Stop passing as a plain success in the notification: the note
+// says the sync stopped early, and is still not urgent (what was copied
+// stands).
+#[test]
+fn a_stopped_sync_has_a_stopped_early_note() {
+    let w = adopted(3);
+    let planned = plan(&w.cfg(), &w.paths).unwrap();
+    let cancel = AtomicBool::new(false);
+    let done = apply(
+        &w.cfg(),
+        &w.paths,
+        &planned.plan,
+        false,
+        &|p| {
+            if let Progress::Copying { done: 1, .. } = p {
+                cancel.store(true, Ordering::SeqCst);
+            }
+        },
+        &cancel,
+    )
+    .unwrap();
+    let note = done.note.expect("a stopped sync has a note");
+    assert_eq!(note.summary, "X3 sync stopped early");
+    assert!(!note.urgent);
+    assert!(note.body.contains("2 tracks"), "{}", note.body);
+}

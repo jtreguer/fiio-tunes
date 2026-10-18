@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=fiio-tunes
+GenericName=FiiO X3 Sync
+Comment=Edit playlists and sync the music library to a FiiO X3
+Exec=fiio-tunes-gui
+Icon=multimedia-player
+Terminal=false
+Categories=AudioVideo;Audio;
+Keywords=FiiO;X3;music;playlist;sync;
+StartupNotify=true
+StartupWMClass=dev.fiiotunes.FiioTunes

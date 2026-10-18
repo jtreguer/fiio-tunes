@@ -7,6 +7,7 @@ use std::sync::atomic::AtomicBool;
 use anyhow::{Context, Result, bail};
 use fiio_core::config::{Config, Paths};
 use fiio_core::exec::{self, Progress};
+use fiio_core::notify::{self, Note};
 use fiio_core::plan::Plan;
 use fiio_core::store::Store;
 use fiio_core::{device, scan, sync};
@@ -52,6 +53,8 @@ pub struct Applied {
     /// why.
     pub skipped: Vec<(PathBuf, String)>,
     pub warnings: Vec<String>,
+    /// The desktop notification for it; `None` when nothing was applied.
+    pub note: Option<Note>,
 }
 
 fn open(paths: &Paths) -> Result<Store> {
@@ -184,6 +187,7 @@ pub fn apply(
         anyhow::Error::new(f.error).context(hint)
     })?;
     Ok(Applied {
+        note: Some(notify::synced(&done)),
         copied: done.copied,
         recopied: done.recopied,
         moved: done.moved,

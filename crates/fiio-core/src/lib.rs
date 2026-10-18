@@ -17,6 +17,7 @@ pub mod lock;
 pub mod manifest;
 pub mod mounts;
 pub mod naming;
+pub mod notify;
 pub mod paths;
 pub mod plan;
 pub mod playlist;

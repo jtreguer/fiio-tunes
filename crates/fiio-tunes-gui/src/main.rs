@@ -1379,7 +1379,16 @@ impl Ui {
             let Some(ui) = ui.upgrade() else { return };
             ui.writing.set(false);
             ui.cancel.replace(None);
-            match joined(result) {
+            let result = joined(result);
+            // Once Apply was pressed, every outcome but an empty plan
+            // notifies: the user may have walked away.
+            if let Some(note) = match &result {
+                Ok(done) => done.note.clone(),
+                Err(e) => Some(fiio_core::notify::failed(&format!("{e:#}"))),
+            } {
+                fiio_core::notify::send(&note);
+            }
+            match result {
                 Ok(done) => {
                     let (title, mut text) = match &done.stopped {
                         None => ("Sync done", String::new()),

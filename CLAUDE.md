@@ -14,13 +14,14 @@ its behaviour must stay identical to iprune's.
 
 ## Status
 
-F0 to F7 done (workspace, forked crates, `init`, `scan`, `playlist`, `import`,
+F0 to F8 done (workspace, forked crates, `init`, `scan`, `playlist`, `import`,
 detection, `device info`, card reading, naming, `probe`, `adopt`, the planner,
 `sync --plan-only`, `scope`, `sync --playlists-only`, backups, verification,
 `restore`, full `sync` with copies, moves, removals and checkpoints,
 take-back, `doctor`, signals, `eject`, the window with its Sync, Adopt,
-Selection, Import and Eject; nothing yet run on the X3: probe, adopt and a
-first sync each need the owner's go). Milestones in
+Selection, Import and Eject, notifications, the desktop entry and
+`install.sh`; on the X3, adopt and a first sync each still need the owner's
+go). Milestones in
 `docs/technical.md` section 16:
 
 | # | Deliverable | Writes to the card |
