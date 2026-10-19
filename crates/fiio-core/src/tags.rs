@@ -216,8 +216,15 @@ fn open(
     opts: ParseOptions,
 ) -> Result<lofty::file::TaggedFile, String> {
     let file = opener(path).map_err(|e| e.to_string())?;
-    Probe::new(std::io::BufReader::new(file))
-        .options(opts)
+    let mut probe = Probe::new(std::io::BufReader::new(file)).options(opts);
+    // The content guess looks for the first MPEG frame within 1024 bytes
+    // of the ID3v2 tag; padding, a second tag or an encoder's text can push
+    // it further. The extension is kept for when the guess finds nothing, as
+    // `Probe::open` does; the MPEG reader then searches the whole file.
+    if let Some(ty) = FileType::from_path(path) {
+        probe = probe.set_file_type(ty);
+    }
+    probe
         .guess_file_type()
         .map_err(|e| e.to_string())?
         .read()

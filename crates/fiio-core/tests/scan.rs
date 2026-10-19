@@ -1514,3 +1514,27 @@ fn a_root_that_is_a_link_is_still_walked() {
     assert!(r.unreadable.is_empty(), "{:?}", r.unreadable);
     assert_eq!(env.tracks()[0].path, link.join("a.mp3"));
 }
+
+// Prevents: a valid MP3 with junk before its first frame being reported
+// unreadable and left out of the index.
+#[test]
+fn mp3_with_padding_before_the_first_frame_is_indexed() {
+    use common::{id3v2_tag, mp3_audio};
+    let mut env = Env::new();
+    let mut bytes = id3v2_tag(4, &id3v24_text("TIT2", 3, b"Padded"));
+    bytes.extend([0u8; 1044]);
+    bytes.extend(mp3_audio(1));
+    let p = env.add_bytes("padded.mp3", &bytes);
+
+    let r = env.scan();
+    assert!(r.unreadable.is_empty(), "{:?}", r.unreadable);
+    assert_eq!(r.added, 1);
+    let t = env.track(&p);
+    assert_eq!(t.info.kind, FileKind::Mp3);
+    assert_eq!(t.tags.title.as_deref(), Some("Padded"));
+    assert!(
+        t.info.duration_ms.is_some_and(|ms| ms > 900),
+        "{:?}",
+        t.info
+    );
+}

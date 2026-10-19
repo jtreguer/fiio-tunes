@@ -7,7 +7,10 @@ mod common;
 use std::fs;
 use std::path::PathBuf;
 
-use common::{Kind, fairplay_m4a, fixture, id3v24_text, mp3_with_id3v2};
+use common::{
+    Kind, fairplay_m4a, fixture, id3v2_tag, id3v22_title, id3v23_title, id3v24_text, mp3_audio,
+    mp3_with_id3v2,
+};
 use fiio_core::tags::{self, FileKind, FileTags, ReadError, Tags};
 
 fn put(dir: &tempfile::TempDir, name: &str, bytes: &[u8]) -> PathBuf {
@@ -277,4 +280,155 @@ fn repeated_values_differing_only_in_case_are_kept_once_the_first_spelling_wins(
     ]);
     assert_eq!(t.artist.as_deref(), Some("A/B"));
     assert_eq!(t.album.as_deref(), Some("b/a"));
+}
+
+// ---- MPEG frames far from the start (lofty's content guess gives up after
+// 1024 bytes of junk; the extension is the fallback)
+
+/// What the encoder of some real files left in front of the audio.
+fn ffmpeg_banner() -> Vec<u8> {
+    let mut v = b" \nffmpeg version git-2016-01-01 Copyright (c) 2000-2016 the FFmpeg developers\n"
+        .to_vec();
+    while v.len() < 1360 {
+        v.extend(b"  configuration: --enable-gpl --enable-libmp3lame --enable-version3\n");
+    }
+    v.truncate(1360);
+    v
+}
+
+/// The duration of the plain fixture, for the duration check.
+fn plain_duration_ms() -> u32 {
+    read_ok(&fixture(Kind::Mp3, 1))
+        .info
+        .duration_ms
+        .expect("fixture has a duration")
+}
+
+/// Layouts of valid MP3s whose first frame is out of the content guess's reach.
+/// Each tuple is a name and the whole file; the first tag's title is "First".
+fn far_frame_layouts() -> Vec<(&'static str, Vec<u8>)> {
+    let audio = mp3_audio(1);
+    let first = id3v2_tag(4, &title("First"));
+    let build = |parts: &[&[u8]]| -> Vec<u8> { [parts.concat(), audio.clone()].concat() };
+    vec![
+        // 1. padding beyond the declared tag size
+        ("padding.mp3", build(&[&first, &[0u8; 1044]])),
+        // 2. encoder text after the tag
+        ("banner_after_tag.mp3", build(&[&first, &ffmpeg_banner()])),
+        // 3. no tag at all, the text first
+        ("banner_only.mp3", build(&[&ffmpeg_banner()])),
+        // 4. v2.3 tag, a stray byte, a second ID3 tag
+        (
+            "stray_byte_second_tag.mp3",
+            build(&[
+                &id3v2_tag(3, &id3v23_title("First")),
+                &[0x20],
+                &id3v2_tag(3, &[0u8; 2049 - 11]),
+            ]),
+        ),
+        // 5. v2.2 tag, a UTF-8 BOM, then a v2.3 tag of about 4 KiB
+        (
+            "bom_second_tag.mp3",
+            build(&[
+                &id3v2_tag(2, &id3v22_title("First")),
+                &[0xEF, 0xBB, 0xBF],
+                &id3v2_tag(3, &[0u8; 4089]),
+            ]),
+        ),
+        // 6. two tags back to back, the frame sync exactly at the 1024 limit
+        (
+            "two_tags_at_limit.mp3",
+            build(&[
+                &id3v2_tag(3, &id3v23_title("First")),
+                &id3v2_tag(4, &[0u8; 1014]),
+            ]),
+        ),
+    ]
+}
+
+// Prevents: valid MP3s with junk between the tag and the first frame being
+// dropped by the scan as unreadable (22 files in the real library).
+#[test]
+fn mp3_with_junk_before_the_first_frame_is_read_by_extension() {
+    let d = tempfile::tempdir().unwrap();
+    let want = plain_duration_ms();
+    for (name, bytes) in far_frame_layouts() {
+        let r = tags::read(&put(&d, name, &bytes))
+            .unwrap_or_else(|e| panic!("{name}: read failed: {e:?}"));
+        assert_eq!(r.info.kind, FileKind::Mp3, "{name}");
+        let ms = r.info.duration_ms.unwrap_or(0);
+        assert!(ms.abs_diff(want) < 200, "{name}: {ms} ms, want ~{want}");
+        assert_eq!(r.tag_error, None, "{name}");
+        // Layout 3 has no tag; every other keeps the first tag's title.
+        let expect = (name != "banner_only.mp3").then_some("First");
+        assert_eq!(r.tags.title.as_deref(), expect, "{name}");
+    }
+}
+
+// Prevents: the extension fallback missing card files read in adoption.
+#[test]
+fn read_with_uses_the_extension_fallback_too() {
+    let d = tempfile::tempdir().unwrap();
+    let (name, bytes) = far_frame_layouts().remove(0);
+    let p = put(&d, name, &bytes);
+    let opened = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let seen = opened.clone();
+    let r = tags::read_with(&p, &move |p: &std::path::Path| {
+        seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        fs::File::open(p)
+    })
+    .unwrap_or_else(|e| panic!("read_with failed: {e:?}"));
+    assert!(
+        opened.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+        "the given opener must be used"
+    );
+    assert_eq!(r.info.kind, FileKind::Mp3);
+    assert_eq!(r.tags.title.as_deref(), Some("First"));
+}
+
+// Prevents: the extension fallback overriding what the content says.
+#[test]
+fn the_content_wins_over_a_misleading_extension() {
+    let d = tempfile::tempdir().unwrap();
+    let flac = fs::read(fixture(Kind::Flac, 1)).unwrap();
+    let r = read_ok(&put(&d, "really_flac.mp3", &flac));
+    assert_eq!(r.info.kind, FileKind::Flac);
+    // And the reverse: an MP3 named .flac is still an MP3.
+    let mp3 = fs::read(fixture(Kind::Mp3, 1)).unwrap();
+    let r = read_ok(&put(&d, "really_mp3.flac", &mp3));
+    assert_eq!(r.info.kind, FileKind::Mp3);
+}
+
+// Prevents: the extension fallback handing junk to the reader of another
+// format and having it accepted.
+#[test]
+fn junk_under_every_other_audio_extension_is_still_unreadable() {
+    let d = tempfile::tempdir().unwrap();
+    let junk: [(&str, Vec<u8>); 2] = [("text", ffmpeg_banner()), ("zeros", vec![0; 4096])];
+    for ext in ["m4a", "wav", "aif", "aiff", "flac", "ogg", "oga", "ape"] {
+        for (what, bytes) in &junk {
+            let p = put(&d, &format!("{what}.{ext}"), bytes);
+            match tags::read(&p) {
+                Err(ReadError::Unreadable(_) | ReadError::Unsupported(_)) => {}
+                other => panic!("{what}.{ext}: expected an error, got {other:?}"),
+            }
+        }
+    }
+}
+
+// Prevents: the extension making any file with a music extension readable.
+#[test]
+fn lots_of_text_and_no_frames_is_still_unreadable() {
+    let d = tempfile::tempdir().unwrap();
+    let mut text = ffmpeg_banner();
+    text.extend(ffmpeg_banner());
+    text.extend(ffmpeg_banner());
+    let mut tagged = id3v2_tag(4, &title("Only a tag"));
+    tagged.extend(&text);
+    for (name, bytes) in [("text.mp3", text), ("tag_and_text.mp3", tagged)] {
+        match tags::read(&put(&d, name, &bytes)) {
+            Err(ReadError::Unreadable(msg)) => assert!(!msg.is_empty(), "{name}"),
+            other => panic!("{name}: expected Unreadable, got {other:?}"),
+        }
+    }
 }

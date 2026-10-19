@@ -209,6 +209,53 @@ pub fn mp3_secs_with_id3v2(variant: u32, secs: u32, frames: &[Vec<u8>]) -> Vec<u
     out
 }
 
+/// The MPEG frames of the cached Mp3 fixture `variant`, with no ID3v2 tag.
+pub fn mp3_audio(variant: u32) -> Vec<u8> {
+    let raw = fs::read(fixture(Kind::Mp3, variant)).unwrap();
+    if raw.starts_with(b"ID3") {
+        let size = raw[6..10]
+            .iter()
+            .fold(0usize, |a, b| (a << 7) | *b as usize);
+        raw[10 + size..].to_vec()
+    } else {
+        raw
+    }
+}
+
+/// An ID3v2 tag of `major` version (2, 3 or 4) around `body`, the frames
+/// already encoded. The header size is syncsafe in every version.
+pub fn id3v2_tag(major: u8, body: &[u8]) -> Vec<u8> {
+    let n = body.len() as u32;
+    let mut t = vec![b'I', b'D', b'3', major, 0, 0];
+    t.extend([
+        (n >> 21) as u8 & 0x7f,
+        (n >> 14) as u8 & 0x7f,
+        (n >> 7) as u8 & 0x7f,
+        n as u8 & 0x7f,
+    ]);
+    t.extend(body);
+    t
+}
+
+/// A Latin-1 TIT2 frame in ID3v2.3 form (plain big-endian size).
+pub fn id3v23_title(text: &str) -> Vec<u8> {
+    let mut f = b"TIT2".to_vec();
+    f.extend((text.len() as u32 + 1).to_be_bytes());
+    f.extend([0, 0, 0]);
+    f.extend(text.as_bytes());
+    f
+}
+
+/// A Latin-1 TT2 (title) frame in ID3v2.2 form (3-byte id and size).
+pub fn id3v22_title(text: &str) -> Vec<u8> {
+    let n = text.len() as u32 + 1;
+    let mut f = b"TT2".to_vec();
+    f.extend(&n.to_be_bytes()[1..]);
+    f.push(0);
+    f.extend(text.as_bytes());
+    f
+}
+
 /// The bytes of the cached Aac fixture `variant` with the `mp4a` sample entry
 /// renamed `drms`, which is how FairPlay protected iTunes Store files look.
 pub fn fairplay_m4a(variant: u32) -> Vec<u8> {
