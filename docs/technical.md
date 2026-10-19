@@ -686,7 +686,10 @@ Decisions taken in F7:
 - The sidebar keeps its width when the window grows
   (`set_resize_start_child(false)` on the paned); only the grid widens.
   iprune's paned let both sides grow, so a window tiled wider than it opened
-  gave a wider sidebar, saved as if dragged. This is the one change to
+  gave a wider sidebar, saved as if dragged.
+- A "FIIO-TUNES" badge (`app-mark`, a fixed orange) follows the Sync button
+  in the header, so the window is not taken for iprune's, which shows
+  "IPRUNE" there. With the sidebar above, these are the only changes to
   iprune's widgets.
 - Notifications come with F8 (section 14.1).
 

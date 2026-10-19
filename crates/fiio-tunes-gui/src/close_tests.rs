@@ -201,7 +201,7 @@ fn run_in_broadway(test_name: &str) {
     let err = err.join().unwrap_or_default();
 
     match status {
-        // A TEST_NAME that no longer matches runs nothing and exits 0.
+        // A test name that no longer matches runs nothing and exits 0.
         Some(status) if status.success() => assert!(
             out.contains(CHECKED),
             "the child ran no check (is test name still the test's path?)\n--- stdout\n{out}"
@@ -280,4 +280,76 @@ fn the_sidebar_keeps_its_width_when_the_window_grows() {
         return;
     }
     run_in_broadway("close_tests::the_sidebar_keeps_its_width_when_the_window_grows");
+}
+
+/// Every widget under `root`, depth first.
+fn descendants(root: &gtk::Widget, found: &mut Vec<gtk::Widget>) {
+    let mut child = root.first_child();
+    while let Some(widget) = child {
+        found.push(widget.clone());
+        descendants(&widget, found);
+        child = widget.next_sibling();
+    }
+}
+
+fn check_header_mark_in_child() {
+    gtk::init().expect("gtk::init against broadway");
+    crate::style::install();
+
+    let header = gtk::HeaderBar::new();
+    let columns = gtk::Button::with_label("Columns");
+    header.pack_start(&columns);
+    let sync = gtk::Button::with_label("Sync");
+    crate::pack_sync_and_mark(&header, &sync);
+    let window = gtk::Window::new();
+    window.set_titlebar(Some(&header));
+    window.present();
+    pump();
+
+    let mut all = Vec::new();
+    descendants(header.upcast_ref(), &mut all);
+    let marks: Vec<gtk::Label> = all
+        .iter()
+        .filter(|w| w.has_css_class("app-mark"))
+        .filter_map(|w| w.clone().downcast::<gtk::Label>().ok())
+        .collect();
+    assert_eq!(marks.len(), 1, "labels with the app-mark class");
+    let mark = &marks[0];
+    assert_eq!(mark.text(), "FIIO-TUNES");
+
+    // Right after Sync, in the same (start) box, not at the end.
+    let sync_widget: &gtk::Widget = sync.upcast_ref();
+    assert_eq!(
+        mark.prev_sibling().as_ref(),
+        Some(sync_widget),
+        "the badge does not directly follow the Sync button"
+    );
+    assert_eq!(mark.parent(), sync.parent(), "different boxes");
+    assert_eq!(
+        sync.prev_sibling().as_ref(),
+        Some(columns.upcast_ref::<gtk::Widget>()),
+        "Sync moved relative to the buttons packed before it"
+    );
+
+    // The stylesheet rule really reaches the badge: a fixed orange.
+    let color = mark.color();
+    let orange = (0xf5 as f32 / 255.0, 0x79 as f32 / 255.0, 0.0);
+    assert!(
+        (color.red() - orange.0).abs() < 0.01
+            && (color.green() - orange.1).abs() < 0.01
+            && color.blue().abs() < 0.01,
+        "badge colour is {color}, not #f57900"
+    );
+    println!("{CHECKED}");
+}
+
+// Prevents: the badge that tells this window from iprune's going missing,
+// changing its text, moving away from the Sync button, or losing its colour.
+#[test]
+fn the_header_badge_follows_the_sync_button_in_orange() {
+    if std::env::var_os(CHILD_MARKER).is_some() {
+        check_header_mark_in_child();
+        return;
+    }
+    run_in_broadway("close_tests::the_header_badge_follows_the_sync_button_in_orange");
 }
