@@ -1825,6 +1825,24 @@ fn context_menu(
     widget.add_controller(click);
 }
 
+/// The sidebar and the main area side by side, the sidebar `width` pixels
+/// wide.
+fn sidebar_paned(
+    side: &impl IsA<gtk::Widget>,
+    main: &impl IsA<gtk::Widget>,
+    width: i32,
+) -> gtk::Paned {
+    let paned = gtk::Paned::new(gtk::Orientation::Horizontal);
+    paned.set_start_child(Some(side));
+    paned.set_end_child(Some(main));
+    paned.set_position(width);
+    paned.set_shrink_start_child(false);
+    // A larger window widens the grid only: with both children resizable
+    // the sidebar grew with it, and that width was saved as if dragged.
+    paned.set_resize_start_child(false);
+    paned
+}
+
 fn build(window: &gtk::ApplicationWindow, data: Data) {
     let slot: UiSlot = Rc::new(OnceCell::new());
     let store = gio::ListStore::new::<glib::BoxedAnyObject>();
@@ -2003,12 +2021,8 @@ fn build(window: &gtk::ApplicationWindow, data: Data) {
     main.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
     main.append(&status);
 
-    let paned = gtk::Paned::new(gtk::Orientation::Horizontal);
-    paned.set_start_child(Some(&side));
-    paned.set_end_child(Some(&main));
     let layouts = load_layouts();
-    paned.set_position(layouts.sidebar_width());
-    paned.set_shrink_start_child(false);
+    let paned = sidebar_paned(&side, &main, layouts.sidebar_width());
     window.set_child(Some(&paned));
 
     let ui = Rc::new(Ui {

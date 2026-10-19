@@ -7,7 +7,7 @@
 //! This needs a display, so it runs against a private `gtk4-broadwayd`. The
 //! GTK work happens in a child process (this test binary run again), so the
 //! shared test process never initialises GTK or changes its environment.
-//! It is the only test in the crate that touches GTK.
+//! These are the only tests in the crate that touch GTK.
 //!
 //! Set `FIIO_TUNES_REQUIRE_GUI_TESTS` to fail instead of skip when
 //! `gtk4-broadwayd` is not installed.
@@ -17,6 +17,7 @@ use std::io::{BufRead, BufReader, Read};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -77,7 +78,9 @@ enum Start {
 /// printed "Listening on <socket>"; a daemon that exits or stays silent for
 /// 5 s counts as a failed attempt and the next number is tried.
 fn start_broadway() -> Start {
-    let base = 200 + std::process::id() % 700;
+    // Tests run in parallel in one process: each takes its own range.
+    static NEXT: AtomicU32 = AtomicU32::new(0);
+    let base = 200 + (std::process::id() + 25 * NEXT.fetch_add(1, Ordering::Relaxed)) % 700;
     for n in base..base + 20 {
         let mut child = match Command::new("gtk4-broadwayd")
             .arg(format!(":{n}"))
@@ -154,15 +157,10 @@ fn drain<R: Read + Send + 'static>(from: R) -> JoinHandle<String> {
     })
 }
 
-// Prevents: a Close or Cancel button capturing its dialog strongly, so the
-// dialog is never destroyed and the busy flag is never cleared.
-#[test]
-fn a_closes_button_lets_the_dialog_be_destroyed() {
-    if std::env::var_os(CHILD_MARKER).is_some() {
-        check_in_child();
-        return;
-    }
-
+/// Runs the test `test_name` again as a child against a private broadway
+/// display, where it takes the `CHILD_MARKER` branch. Skips when
+/// `gtk4-broadwayd` is missing, unless `FIIO_TUNES_REQUIRE_GUI_TESTS` is set.
+fn run_in_broadway(test_name: &str) {
     let (_daemon, display) = match start_broadway() {
         Start::Running(daemon, display) => (daemon, display),
         Start::NotInstalled => {
@@ -176,7 +174,7 @@ fn a_closes_button_lets_the_dialog_be_destroyed() {
     };
 
     let mut child = Command::new(std::env::current_exe().expect("current_exe"))
-        .args(["--exact", TEST_NAME, "--nocapture", "--test-threads=1"])
+        .args(["--exact", test_name, "--nocapture", "--test-threads=1"])
         .env(CHILD_MARKER, "1")
         .env("GDK_BACKEND", "broadway")
         .env("BROADWAY_DISPLAY", format!(":{display}"))
@@ -206,11 +204,80 @@ fn a_closes_button_lets_the_dialog_be_destroyed() {
         // A TEST_NAME that no longer matches runs nothing and exits 0.
         Some(status) if status.success() => assert!(
             out.contains(CHECKED),
-            "the child ran no check (is TEST_NAME still the test's path?)\n--- stdout\n{out}"
+            "the child ran no check (is test name still the test's path?)\n--- stdout\n{out}"
         ),
         Some(status) => {
             panic!("child test failed ({status})\n--- stdout\n{out}\n--- stderr\n{err}")
         }
         None => panic!("child test timed out\n--- stdout\n{out}\n--- stderr\n{err}"),
     }
+}
+
+// Prevents: a Close or Cancel button capturing its dialog strongly, so the
+// dialog is never destroyed and the busy flag is never cleared.
+#[test]
+fn a_closes_button_lets_the_dialog_be_destroyed() {
+    if std::env::var_os(CHILD_MARKER).is_some() {
+        check_in_child();
+        return;
+    }
+    run_in_broadway(TEST_NAME);
+}
+
+/// Pumps the main context until `done` holds or 10 s pass.
+fn pump_until(what: &str, done: impl Fn() -> bool) {
+    let context = glib::MainContext::default();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !done() {
+        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        while context.iteration(false) {}
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+fn check_sidebar_in_child() {
+    use crate::view_model::{Layouts, SIDEBAR_WIDTH};
+
+    gtk::init().expect("gtk::init against broadway");
+
+    let side = gtk::Label::new(Some("sidebar"));
+    let main = gtk::Label::new(Some("grid"));
+    main.set_hexpand(true);
+    let paned = crate::sidebar_paned(&side, &main, SIDEBAR_WIDTH);
+    let window = gtk::Window::new();
+    window.set_child(Some(&paned));
+    window.set_default_size(600, 400);
+    window.present();
+    pump_until("the first allocation", || paned.width() == 600);
+    assert_eq!(paned.position(), SIDEBAR_WIDTH, "before the window grows");
+
+    // Stands in for the compositor tiling the window larger. Broadway's
+    // screen is 1024 wide, so stay under it.
+    window.set_default_size(1000, 400);
+    pump_until("the larger allocation", || paned.width() == 1000);
+    // Let any proportional redistribution settle.
+    pump();
+    assert_eq!(paned.width(), 1000, "the window did not grow");
+    assert_eq!(
+        paned.position(),
+        SIDEBAR_WIDTH,
+        "the sidebar followed the window's width"
+    );
+
+    // What save_layouts does: the untouched width must not be saved.
+    let mut layouts = Layouts::default();
+    layouts.note_sidebar(paned.position());
+    assert_eq!(layouts.sidebar, None, "a width never dragged was saved");
+    println!("{CHECKED}");
+}
+
+// Prevents: the sidebar growing with the window (resize_start_child left on),
+// so its stretched width was saved to ui.toml as if the user had dragged it.
+#[test]
+fn the_sidebar_keeps_its_width_when_the_window_grows() {
+    if std::env::var_os(CHILD_MARKER).is_some() {
+        check_sidebar_in_child();
+        return;
+    }
+    run_in_broadway("close_tests::the_sidebar_keeps_its_width_when_the_window_grows");
 }

@@ -683,6 +683,11 @@ Decisions taken in F7:
 - Eject: `device::eject` unmounts and powers off through `udisksctl`, and
   refuses anything but the block device of a FiiO player. The CLI gains
   `fiio-tunes eject` (section 13), which it lacked.
+- The sidebar keeps its width when the window grows
+  (`set_resize_start_child(false)` on the paned); only the grid widens.
+  iprune's paned let both sides grow, so a window tiled wider than it opened
+  gave a wider sidebar, saved as if dragged. This is the one change to
+  iprune's widgets.
 - Notifications come with F8 (section 14.1).
 
 ### 14.1 Packaging and notifications (F8)
