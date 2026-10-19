@@ -681,9 +681,11 @@ fn file_with_unparseable_tags_is_indexed_without_tags_and_reported() {
     assert!(env.tracks().iter().all(|t| t.path != garbage));
     assert!(!r.untagged.iter().any(|(p, _)| *p == good));
 
-    // A file with a tag error is never "unchanged": it is read again.
+    // Read again, found the same: unchanged, and still reported.
     let r = env.scan();
-    assert_eq!((r.added, r.unchanged, r.updated), (0, 1, 1));
+    assert_eq!((r.added, r.unchanged, r.updated), (0, 2, 0));
+    assert_eq!(r.untagged.len(), 1, "{:?}", r.untagged);
+    assert_eq!(r.untagged[0].0, bad);
     assert!(r.unreadable.len() == 1 && r.missing.is_empty());
 }
 
@@ -757,10 +759,11 @@ fn set_mtime(p: &std::path::Path, t: SystemTime) {
         .unwrap();
 }
 
-// Prevents: a file with unparseable tags being treated as unchanged (and so
-// never retried or reported again) once its size and mtime match the index.
+// Prevents: a file with unparseable tags dropping out of the report once its
+// size and mtime match the index, and (the other way) being counted as updated
+// on every scan while nothing about it changed.
 #[test]
-fn untagged_file_is_listed_and_retried_on_every_scan() {
+fn untagged_file_stays_listed_every_scan_without_counting_as_updated() {
     let mut env = Env::new();
     let bad = env.add_bytes("bad.mp3", &mp3_with_id3v2(2, &unparseable_tag()));
     env.add("ok.mp3", Kind::Mp3, 1);
@@ -770,7 +773,7 @@ fn untagged_file_is_listed_and_retried_on_every_scan() {
         let r = env.scan();
         assert_eq!(
             (r.added, r.unchanged, r.updated),
-            (0, 1, 1),
+            (0, 2, 0),
             "round {round}"
         );
         assert_eq!(r.untagged.len(), 1, "round {round}: {:?}", r.untagged);
@@ -779,6 +782,122 @@ fn untagged_file_is_listed_and_retried_on_every_scan() {
         assert!(r.unreadable.is_empty() && r.missing.is_empty());
         assert_eq!(env.track(&bad).id, id, "same row each time");
     }
+}
+
+/// Overwrites a column only `store::update_track` writes, so a rewrite of the
+/// row shows as the real value coming back.
+fn plant_duration(env: &Env, id: i64, ms: i64) {
+    env.store
+        .conn()
+        .execute("UPDATE tracks SET duration_ms = ?2 WHERE id = ?1", [id, ms])
+        .unwrap();
+}
+
+fn duration_of(env: &Env, id: i64) -> Option<i64> {
+    env.store
+        .conn()
+        .query_row("SELECT duration_ms FROM tracks WHERE id = ?1", [id], |r| {
+            r.get(0)
+        })
+        .unwrap()
+}
+
+// Prevents: the retry of an untagged file rewriting its row on every scan
+// (update_track) although the file did not change.
+#[test]
+fn retrying_an_unchanged_untagged_file_does_not_rewrite_its_row() {
+    let mut env = Env::new();
+    let bad = env.add_bytes("bad.mp3", &mp3_with_id3v2(2, &unparseable_tag()));
+    env.scan();
+    let id = env.track(&bad).id;
+    let real = duration_of(&env, id);
+    assert!(real.is_some_and(|ms| ms > 900), "{real:?}");
+    plant_duration(&env, id, 12345);
+    let r = env.scan();
+    assert_eq!((r.unchanged, r.updated), (1, 0));
+    assert_eq!(r.untagged.len(), 1);
+    assert_eq!(duration_of(&env, id), Some(12345), "row was rewritten");
+}
+
+// Prevents: the retry shortcut keeping an untagged row whose stored tag_error
+// no longer matches what the reader reports: the row must be rewritten.
+#[test]
+fn untagged_row_with_a_different_stored_error_is_rewritten() {
+    let mut env = Env::new();
+    let bad = env.add_bytes("bad.mp3", &mp3_with_id3v2(2, &unparseable_tag()));
+    env.scan();
+    let id = env.track(&bad).id;
+    let real = env.track(&bad).tag_error.expect("fixture must fail to tag");
+    let stale = "stale error from an older reader";
+    assert_ne!(real, stale);
+    env.store
+        .conn()
+        .execute(
+            "UPDATE tracks SET tag_error = ?2 WHERE id = ?1",
+            rusqlite::params![id, stale],
+        )
+        .unwrap();
+    assert_eq!(env.track(&bad).tag_error.as_deref(), Some(stale));
+
+    let r = env.scan();
+    assert_eq!((r.unchanged, r.updated, r.added), (0, 1, 0));
+    assert_eq!(r.untagged.len(), 1, "{:?}", r.untagged);
+    assert_eq!(r.untagged[0].0, bad);
+    let after = env.track(&bad);
+    assert_eq!(after.id, id);
+    assert_eq!(after.tag_error.as_deref(), Some(real.as_str()));
+
+    // Now in step with the reader: unchanged again.
+    let r = env.scan();
+    assert_eq!((r.unchanged, r.updated), (1, 0));
+}
+
+// Prevents: the unchanged shortcut hiding a content change that keeps size and
+// mtime while the tags still fail: the hash must follow the file.
+#[test]
+fn untagged_file_changed_in_content_with_same_size_and_mtime_is_updated() {
+    let mut env = Env::new();
+    let first = mp3_with_id3v2(2, &unparseable_tag());
+    // Same length, still unparseable, different bytes (the title text).
+    let second = mp3_with_id3v2(2, &[tit2("Lust"), unparseable_tag().remove(1)]);
+    assert_eq!(first.len(), second.len(), "fixture precondition");
+    assert_ne!(first, second);
+    let p = env.add_bytes("a.mp3", &first);
+    let when = SystemTime::now() - Duration::from_secs(3600);
+    set_mtime(&p, when);
+    env.scan();
+    let before = env.track(&p);
+    assert!(before.tag_error.is_some());
+
+    fs::write(&p, &second).unwrap();
+    set_mtime(&p, when);
+    let r = env.scan();
+    assert_eq!((r.added, r.unchanged, r.updated), (0, 0, 1));
+    assert_eq!(r.untagged.len(), 1, "{:?}", r.untagged);
+    let after = env.track(&p);
+    assert_eq!(after.id, before.id);
+    assert!(after.tag_error.is_some());
+    assert_ne!(after.hash, before.hash);
+    assert_eq!(after.hash, *blake3::hash(&second).as_bytes());
+}
+
+// Prevents: the unchanged shortcut swallowing a move of an untagged file: the
+// row follows the file, keeps its id and is not duplicated.
+#[test]
+fn renamed_untagged_file_is_a_move_and_stays_listed() {
+    let mut env = Env::new();
+    let old = env.add_bytes("old.mp3", &mp3_with_id3v2(2, &unparseable_tag()));
+    env.scan();
+    let id = env.track(&old).id;
+    let new = env.music.join("new.mp3");
+    fs::rename(&old, &new).unwrap();
+    let r = env.scan();
+    assert_eq!(r.moved, vec![(old.clone(), new.clone())]);
+    assert_eq!((r.added, r.updated), (0, 0));
+    assert_eq!(r.untagged.len(), 1, "{:?}", r.untagged);
+    assert_eq!(r.untagged[0].0, new);
+    assert_eq!(env.tracks().len(), 1);
+    assert_eq!(env.track(&new).id, id);
 }
 
 // Prevents: a repaired file staying flagged forever. The repaired file has the

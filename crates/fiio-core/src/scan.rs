@@ -398,6 +398,19 @@ pub fn scan(
             }
         };
         match t {
+            // A file whose tags failed, retried with its content unchanged
+            // and its tags failing the same way: the row is kept as it is.
+            Some(t)
+                if t.missing_since.is_none()
+                    && t.tag_error.is_some()
+                    && rec.tag_error == t.tag_error
+                    && rec.hash == t.hash
+                    && rec.size == t.size
+                    && rec.mtime_ns == t.mtime_ns
+                    && rec.path == t.path =>
+            {
+                report.unchanged += 1
+            }
             Some(t) => {
                 store::update_track(&tx, t.id, &rec)?;
                 if t.missing_since.is_some() {
